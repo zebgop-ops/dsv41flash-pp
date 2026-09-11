@@ -34,6 +34,38 @@ _PREFILL_WARMUP_N = 8192
 _INDEXER_LUT_NAN_VALUE = 480.0
 
 
+# dsv41: capture-safe autotune. Under FULL cudagraph mode the whole decode
+# attention (this indexer kernel included) is captured; a Triton autotune key
+# that was not primed by the warmups would benchmark (device sync) inside the
+# capture and abort it (cudaErrorStreamCaptureUnsupported). When that happens,
+# take the configs in declared order instead of benchmarking and say so, so the
+# missing warmup can be added. The paged/prefill sweeps here only differ in
+# num_stages, so the first config is a sound choice.
+import triton.runtime.autotuner as _tt_autotuner
+from vllm.logger import init_logger as _dsv41_init_logger
+
+_dsv41_logger = _dsv41_init_logger(__name__)
+_dsv41_orig_bench = _tt_autotuner.Autotuner._bench
+
+
+def _dsv41_capture_safe_bench(self, *args, config, **kwargs):
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        rank = self.configs.index(config) if config in self.configs else 0
+        if rank == 0:
+            _dsv41_logger.warning(
+                "Triton autotune for %s requested during CUDA graph capture; "
+                "using the first config without benchmarking (add a warmup for "
+                "this key)", getattr(self.base_fn, "__name__", "?"),
+            )
+        return [float(rank), float(rank), float(rank)]
+    return _dsv41_orig_bench(self, *args, config=config, **kwargs)
+
+
+if not getattr(_tt_autotuner.Autotuner, "_dsv41_capture_safe", False):
+    _tt_autotuner.Autotuner._bench = _dsv41_capture_safe_bench
+    _tt_autotuner.Autotuner._dsv41_capture_safe = True
+
+
 def _get_e4m3fn_bf16_lut(device: torch.device) -> torch.Tensor:
     return get_e4m3fn_bf16_lut(device, nan_value=_INDEXER_LUT_NAN_VALUE)
 

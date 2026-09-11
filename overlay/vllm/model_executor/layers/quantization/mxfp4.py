@@ -717,8 +717,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     and w2_bias.shape[1] == hidden_size
                 )
 
-        # Convert weights to kernel format
-        w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
+        # dsv41: staged marlin repack (no raw+packed HBM transient)
+        if self.mxfp4_backend == Mxfp4MoeBackend.MARLIN:
+            del w13, w2, w13_scale, w2_scale  # the layer keeps the only references
+            from hybrid.marlin_staged import prepare_marlin_mxfp4_moe_staged
+
+            prepare_marlin_mxfp4_moe_staged(layer)
+            w13, w2 = layer.w13_weight, layer.w2_weight
+            w13_scale, w2_scale = layer.w13_weight_scale, layer.w2_weight_scale
+            w13_bias = getattr(layer, "w13_bias", None)
+            w2_bias = getattr(layer, "w2_bias", None)
+        else:
+          w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
             convert_weight_to_mxfp4_moe_kernel_format(
                 mxfp4_backend=self.mxfp4_backend,
                 layer=layer,
@@ -774,17 +784,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer):
-        w13 = layer.w13_weight
-        w2 = layer.w2_weight
-        w13_scale = layer.w13_weight_scale
-        w2_scale = layer.w2_weight_scale
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
 
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
 
-        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
+        # dsv41: pass the raw tensors without local references (see _setup_kernel)
+        self._setup_kernel(layer, layer.w13_weight, layer.w2_weight, layer.w13_weight_scale,
+                           layer.w2_weight_scale, w13_bias, w2_bias)
 
     def get_fused_moe_quant_config(
         self,

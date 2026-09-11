@@ -118,11 +118,29 @@ class CpuRoutedExperts:
         swiglu_limit: float,
         gpu_experts_mask: torch.Tensor | None = None,
     ) -> None:
-        from kt_kernel import KTMoEWrapper
-
         threads = int(os.environ.get("DSV41_CPU_EXPERT_THREADS", "16"))
         self.layer_idx = layer_idx
         self.top_k = top_k
+        self.num_experts = num_experts
+        self.backend = os.environ.get("DSV41_CPU_MOE", "native")
+        if self.backend == "native":
+            # overlay/hybrid/cpu_moe.cpp: AVX2/OpenMP MXFP4 experts straight from the
+            # HF shards; ~2x kt-kernel at batch 1 (which runs one thread per expert).
+            from hybrid.cpu_moe import NativeCpuMoe
+
+            self.native = NativeCpuMoe(
+                weight_path, layer_idx, num_experts, hidden_size, intermediate_size,
+                swiglu_limit, threads=threads, max_tokens=max_tokens,
+            )
+            self.wrapper = None
+            logger.info(
+                "layer %d: %d routed experts on CPU via native MXFP4 kernel (%d threads, "
+                "max_tokens %d, swiglu_limit %s)",
+                layer_idx, num_experts, threads, max_tokens, swiglu_limit,
+            )
+            return
+        from kt_kernel import KTMoEWrapper
+
         self.wrapper = KTMoEWrapper(
             layer_idx=layer_idx,
             num_experts=num_experts,
@@ -154,6 +172,12 @@ class CpuRoutedExperts:
     def load_weights(self) -> None:
         import gc
 
+        if self.wrapper is None:
+            self.native.load()
+            dev = torch.device("cuda", torch.cuda.current_device())
+            self.native.warmup(dev, self.top_k)
+            logger.info("layer %d: CPU experts loaded (native)", self.layer_idx)
+            return
         p2l = torch.arange(self.num_experts, dtype=torch.int64)
         self.wrapper.load_weights(p2l)
         # kt-kernel's C++ MoE memcpys the packed FP4 weights and converts the
@@ -177,6 +201,10 @@ class CpuRoutedExperts:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
+        if self.wrapper is None:
+            return self.native.forward(
+                hidden_states.view(-1, hidden_states.shape[-1]), topk_ids, topk_weights
+            )
         stream = torch.cuda.current_stream(hidden_states.device).cuda_stream
         return self.wrapper.forward(
             hidden_states.view(-1, hidden_states.shape[-1]),
@@ -195,6 +223,8 @@ def install_cpu_experts(model: torch.nn.Module, vllm_config) -> None:
     # with a temporary buffer replays against freed pinned memory (segfault in
     # the worker thread). Register vLLM's capture sizes so those buffers persist.
     try:
+        if os.environ.get("DSV41_CPU_MOE", "native") != "kt":
+            raise ImportError("native CPU MoE backend: no kt-kernel capture sizes needed")
         from kt_kernel import KTMoEWrapper as _KT
 
         sizes = sorted(set(int(s) for s in (vllm_config.compilation_config.cudagraph_capture_sizes or [])))

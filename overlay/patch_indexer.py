@@ -284,7 +284,7 @@ rep('''        if current_platform.is_cuda() and not has_deep_gemm():
             _nh = num_heads if num_heads is not None else 32
             device = topk_indices_buffer.device
             warmup_fp8_mqa_logits_triton(_nh, head_dim, device)
-            for _bs in sorted({64, 256, get_current_vllm_config().cache_config.block_size}):
+            for _bs in sorted({64, 128, 256, get_current_vllm_config().cache_config.block_size}):
                 warmup_fp8_paged_mqa_logits_triton(_nh, head_dim, _bs, device)
 ''')
 rep('''        use_fp4_cache: bool = False,

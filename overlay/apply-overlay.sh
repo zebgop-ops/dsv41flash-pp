@@ -20,5 +20,6 @@ python3 "$HERE/patch_weight_iter.py"     "$V/model_executor/model_loader/weight_
 python3 "$HERE/patch_kv_groups.py"       "$V/v1/core/kv_cache_utils.py"
 python3 "$HERE/patch_mla_indexer.py"     "$V/v1/attention/backends/mla/indexer.py"
 python3 "$HERE/patch_v1_circular.py"     "$V/v1/worker/gpu_model_runner.py"
+python3 "$HERE/patch_marlin_staged.py"   "$V/model_executor/layers/quantization/mxfp4.py"
 for f in $(find "$V" -name '*.py'); do python3 -c "import ast,sys;ast.parse(open('$f').read())" || { echo "SYNTAX ERROR: $f"; exit 1; }; done
 echo "overlay applied: $(find "$V" -name '*.py' | wc -l) files"

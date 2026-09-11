@@ -11,18 +11,19 @@ The checkpoint is served in its **native formats** (block-FP8 dense weights, MXF
 experts, FP8 Engram rows): no requantization. What does not fit on the cards is split three
 ways:
 
-- **GPU:** 28 layers' experts + all attention, Marlin MXFP8/MXFP4 kernels, pipeline parallel 4.
-- **CPU RAM:** the routed experts of 12 decoder layers (21-23, 31-39) run on the host through
-  [kt-kernel](https://github.com/kvcache-ai/ktransformers)'s AVX2 MXFP4 MoE, reading the HF
-  shards directly (~100 GB of RAM).
+- **GPU:** 31 layers' experts (8 per rank) + all attention, Marlin MXFP8/MXFP4 kernels,
+  pipeline parallel 4 (partition 8,12,8,12).
+- **CPU RAM:** the routed experts of 9 layers (16-19, 35-39) run on the host through a small
+  native AVX2/OpenMP MXFP4 MoE kernel (`overlay/hybrid/cpu_moe.cpp`) that reads the HF shards
+  directly (~65 GB of RAM); kt-kernel remains selectable (`DSV41_CPU_MOE=kt`).
 - **NVMe:** the two 94.6 GiB Engram tables are never loaded. Rows are `pread` from the
   original safetensors shards through the page cache inside a CUDA host callback, so the
   lookup sits in the CUDA graph like any other op.
 
 Headline numbers (details in **[RESULTS.md](RESULTS.md)**): correct answers with reasoning,
-exact planted-value recall at 29k tokens, **8 tok/s single-stream decode, 16 tok/s at 4
-streams, ~65 tok/s prefill**, 2.3M-token KV pool at 131k context. Slow, but it is a 750B
-model on four mining cards, and it is correct.
+exact planted-value recall at 29k tokens, **16.7 tok/s single-stream decode, ~100 tok/s
+prefill**, 933k-token KV pool at 131k context. It is a 750B model on four mining cards, and
+it is correct.
 
 The official `vllm/vllm-openai:deepseekv41-flash-0909` image (vLLM PR
 [#56214](https://github.com/vllm-project/vllm/pull/56214) lineage) only has Hopper/Blackwell
@@ -40,6 +41,7 @@ docker pull vllm/vllm-openai:deepseekv41-flash-0909
 hf download deepseek-ai/DeepSeek-V4.1-Flash                 # 475 GiB, 48 shards, into the HF cache
 pip download kt-kernel==0.7.0.post2 gguf typer rich -d kt/wheel   # then unpack the wheels into kt/site
 docker run --rm -v $PWD/overlay/engram_ssd:/w --entrypoint bash vllm/vllm-openai:deepseekv41-flash-0909 /w/build.sh
+docker run --rm -v $PWD/overlay/hybrid:/w --entrypoint bash vllm/vllm-openai:deepseekv41-flash-0909 /w/build.sh
 ./overlay/import-check.sh                                    # CPU-only import test of every overlaid module
 DSV41_HF=$HOME/.cache/huggingface ./serve/run-dsv41-pp4.sh   # serves DSv41Flash on :8004
 ```
@@ -49,9 +51,10 @@ dependencies (`pip install --target kt/site kt_kernel-0.7.0.post2-*.whl gguf typ
 delete any `deep_gemm` it drags in). The launcher mounts it read-only into the image.
 
 `serve/run-dsv41-pp4.sh` is the exact production launcher, with every flag, env var and
-bind-mount. Knobs: `DSV41_PARTITION` (default `7,7,10,16`), `DSV41_CPU_EXPERT_LAYERS`
-(`21-23,31-39`), `DSV41_ENGRAM_STORAGE` (`ssd`), `DSV41_MAXLEN` (131072), `DSV41_SEQS`,
-`DSV41_UTIL`, `DSV41_CG` (`PIECEWISE`; `NONE` for diagnostics), `DSV41_GPUS`,
+bind-mount. Knobs: `DSV41_PARTITION` (default `8,12,8,12`), `DSV41_CPU_EXPERT_LAYERS`
+(`16-19,35-39`), `DSV41_CPU_MOE` (`native` | `kt`), `DSV41_CPU_EXPERT_THREADS` (16, one per
+physical core), `DSV41_ENGRAM_STORAGE` (`ssd`), `DSV41_MAXLEN` (131072), `DSV41_SEQS`,
+`DSV41_UTIL` (0.97), `DSV41_CG` (`FULL_AND_PIECEWISE`; `NONE` for diagnostics), `DSV41_GPUS`,
 `DSV41_EXTRA_ARGS`, `DSV41_EXTRA_DOCKER` (e.g. `"-e CUDA_LAUNCH_BLOCKING=1"`), and the
 diagnostic switches in [FINDINGS.md](FINDINGS.md). It pre-flights the checkpoint, the
 driver (kernel module vs userland mismatch after an upgrade), other servers on the cards,
@@ -76,14 +79,16 @@ that produced it.
    FP8 rows + UE8M0 scales straight from shards 47/48 → pinned staging → H2D → dequant on the
    GPU. Design adapted from 0xSero's row store (MIT); rewritten with a thread pool over the
    page cache.
-3. **CPU experts** (`overlay/hybrid/cpu_experts.py`). For the configured layers the routed
-   experts are created on the meta device and skipped by the loader; the MoE runner's
-   forward runs the gate, router and shared expert on the GPU and hands top-k ids and
-   weights to a kt-kernel `KTMoEWrapper(method="MXFP4")`, whose loader reads the HF expert
-   layout as is. kt-kernel keeps a second host copy per layer unless the Python-side tensors
-   are released after load (8.3 GB/layer instead of 13.4), and its temporary pinned I/O
-   buffers must be registered for vLLM's CUDA-graph capture sizes or graph replay reads freed
-   memory.
+3. **CPU experts** (`overlay/hybrid/cpu_experts.py`, `cpu_moe.cpp`). For the configured layers
+   the routed experts are created on the meta device and skipped by the loader; the MoE
+   runner's forward runs the gate, router and shared expert on the GPU and hands top-k ids
+   and weights to the host through pinned staging and a `cudaLaunchHostFunc` node, so the
+   call sits inside the CUDA graph. The native kernel (AVX2/FMA + OpenMP, E2M1 nibbles
+   decoded through a byte LUT, fp32 accumulate, exact against a torch reference) streams the
+   FP4 weights at ~44 GB/s of this host's ~52 GB/s: 2.4 ms per layer-step at batch 1.
+   kt-kernel's AVX2 MXFP4 path, which it replaces, runs one thread per selected expert and
+   takes 5.7 ms regardless of thread count (and needs its pinned buffers registered for
+   graph capture sizes).
 4. **Pipeline parallel across kv-sharing groups** (`overlay/hybrid/pp_shadow.py`). V4.1
    consumers read their kv-source layer's compressed KV and indexer K caches on the same
    rank, and the decoder group (layers 20-39) does not fit one card. A receiving rank gets a
@@ -97,9 +102,17 @@ that produced it.
    runner (required for Engram lookback) ran the generic token→slot kernel on the
    compressor's circular-buffer cache group, reading past its one-block-per-request table
    (an MMU fault on the CMP at ~2k prompt tokens, silent garbage reads on Hopper).
-6. **Smaller upstream fixes:** KV-cache tensor builder iterating other ranks' layers of a
+6. **Marlin repack without the load-time transient** (`overlay/hybrid/marlin_staged.py`).
+   vLLM's MXFP4 MoE prepare keeps raw and packed expert tensors on the GPU at once (~6.7 GiB
+   per layer, the raw ones pinned by the caller frames), which capped a 64 GB card at 7
+   expert layers. Staging the raw tensor through host RAM and packing expert by expert (bit-
+   exact against vLLM's prepare) lets 8 layers per rank load, so only 9 layers' experts stay
+   on the CPU. The staging must be pageable: torch's pinned-host allocator caches freed
+   blocks for the process lifetime and the four workers OOM'd the host.
+7. **Smaller upstream fixes:** KV-cache tensor builder iterating other ranks' layers of a
    projected group under PP; `has_deep_gemm()` vs `is_deep_gemm_supported()` gating in the
-   MLA indexer metadata builder; tilelang prenorm and `execute_in_parallel` capture guards.
+   MLA indexer metadata builder; tilelang prenorm and `execute_in_parallel` capture guards;
+   a Triton autotune guard for keys that surface only under full-graph capture.
 
 ## Layout
 
@@ -109,7 +122,8 @@ overlay/vllm/            the Python overlay, mounted over the image's vllm packa
 overlay/patch_*.py       anchor-based, idempotent patch scripts; apply-overlay.sh runs them all
 overlay/make-overlay.sh  extracts pristine files from the image (for diffing / re-seeding)
 overlay/engram_ssd/      row_store.cpp + build.sh, engram_ssd.py, CPU/GPU tests
-overlay/hybrid/          cpu_experts.py (kt-kernel), pp_shadow.py (PP shadow sources), tests
+overlay/hybrid/          cpu_experts.py, cpu_moe.cpp/.py (native CPU MoE), marlin_staged.py,
+                         pp_shadow.py (PP shadow sources), build.sh, tests
 overlay/sm80-src/        the V4 Ampere files (haosdent/vllm@f8ea5bb) the port was regexed from
 patches/vllm-overlay.diff  full delta vs the pristine image
 ktests/                  kernel tests and the torch oracles (ref_layer0*.py, ref_stages.py)

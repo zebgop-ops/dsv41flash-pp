@@ -19,17 +19,17 @@ SNAPSHOT=${DSV41_SNAPSHOT:-$(ls "$HFCACHE/hub/models--deepseek-ai--DeepSeek-V4.1
 MODEL="/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/$SNAPSHOT"
 # Layer partition (see PLAN.md "PP4 layout"): cuts must sit on kv-source (2,8,14,20) or
 # index-source (24,28,32,36) boundaries; cuts at 24+ get a shadow of kv source 20.
-PARTITION=${DSV41_PARTITION:-7,7,10,16}
+PARTITION=${DSV41_PARTITION:-8,12,8,12}
 PP=$(echo "$PARTITION" | tr "," "\n" | wc -l)
 # Layers whose 384 routed experts run on the CPU (kt-kernel). Decoder layers only (they do
 # not run on prompt tokens once SWA-bounded replay lands; today they do, so prefill pays).
-CPU_LAYERS=${DSV41_CPU_EXPERT_LAYERS:-21-23,31-39}   # max 7 GPU layers per rank (47 GiB experts + repack transient + KV)
+CPU_LAYERS=${DSV41_CPU_EXPERT_LAYERS:-16-19,35-39}   # 8 GPU expert layers per rank fit since the Marlin repack is staged through host RAM
 ENGRAM=${DSV41_ENGRAM_STORAGE:-ssd}
 GPU_ORDER=${DSV41_GPUS:-all}
-UTIL=${DSV41_UTIL:-0.92}
+UTIL=${DSV41_UTIL:-0.97}
 MAXLEN=${DSV41_MAXLEN:-131072}
 SEQS=${DSV41_SEQS:-4}
-CG=${DSV41_CG:-PIECEWISE}
+CG=${DSV41_CG:-FULL_AND_PIECEWISE}
 SPEC_N=${DSV41_SPEC:-0}              # DSpark draft length (0 = off) -- enable once the base path is validated
 EXTRA_ARGS=${DSV41_EXTRA_ARGS:-}
 PATCHDIR=${DSV41_PATCH:-$RUNDIR/overlay/vllm}
@@ -97,7 +97,7 @@ docker run -d --name "$NAME" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$GPU_OR
   -e PYTHONPATH=/opt/dsv41:/opt/dsv41/kt-site \
   -e VLLM_PP_LAYER_PARTITION="$PARTITION" \
   -e DSV41_CPU_EXPERT_LAYERS="$CPU_LAYERS" -e DSV41_ENGRAM_STORAGE="$ENGRAM" \
-  -e DSV41_ENGRAM_ZERO="${DSV41_ENGRAM_ZERO:-0}" -e DSV41_DEBUG_STATS="${DSV41_DEBUG_STATS:-0}" -e DSV41_MHC_TORCH="${DSV41_MHC_TORCH:-0}" -e DSV41_DEBUG_DUMP="${DSV41_DEBUG_DUMP:-}" -v "$RUNDIR/dump:/dump" -e DSV41_MODEL_DIR="$MODEL" -e DSV41_MEM_CAP_FRACTION="$MEM_CAP" -e DSV41_SKIP_WEIGHT_RE="$SKIP_RE" \
+  -e DSV41_ENGRAM_ZERO="${DSV41_ENGRAM_ZERO:-0}" -e DSV41_DEBUG_STATS="${DSV41_DEBUG_STATS:-0}" -e DSV41_MHC_TORCH="${DSV41_MHC_TORCH:-0}" -e DSV41_DEBUG_DUMP="${DSV41_DEBUG_DUMP:-}" -e DSV41_CPU_MOE="${DSV41_CPU_MOE:-native}" -e DSV41_DEBUG_TIMING="${DSV41_DEBUG_TIMING:-0}" -e DSV41_DEBUG_PROFILE="${DSV41_DEBUG_PROFILE:-0}" -e DSV41_CPU_EXPERT_THREADS="${DSV41_CPU_EXPERT_THREADS:-16}" -v "$RUNDIR/dump:/dump" -e DSV41_MODEL_DIR="$MODEL" -e DSV41_MEM_CAP_FRACTION="$MEM_CAP" -e DSV41_SKIP_WEIGHT_RE="$SKIP_RE" \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e VLLM_USE_V2_MODEL_RUNNER=0 -e PYTHONFAULTHANDLER=1 \
   ${DSV41_EXTRA_DOCKER:-} \
   "$IMG" \

@@ -42,6 +42,16 @@ new = '''            hidden_states, residual, post_mix, res_mix, pre_mix = layer
                          "positions": positions.detach().cpu(),
                          "input_ids": input_ids.detach().cpu() if input_ids is not None else None},
                         f"{_d}/{_tag}.pt")
+            if _dsv41_dbg_timing():
+                torch.cuda.synchronize()
+                _now = _dsv41_time.perf_counter()
+                if idx == self.start_layer:
+                    self._dsv41_t_prev = _now; self._dsv41_t_first = _now
+                    self._dsv41_tick = getattr(self, "_dsv41_tick", 0) + 1
+                if hidden_states.shape[0] == 1 and self._dsv41_tick % 16 == 0:
+                    logger.info("TIMING L%d T=%d layer %.2f ms cum %.2f ms", idx, hidden_states.shape[0],
+                                (_now - self._dsv41_t_prev) * 1e3, (_now - self._dsv41_t_first) * 1e3)
+                self._dsv41_t_prev = _now
             if _dsv41_dbg_stats():
                 _h = hidden_states.float()
                 _r = residual.float() if residual is not None else _h
@@ -69,6 +79,13 @@ new2 = old2 + '''import os as _dsv41_os
 
 def _dsv41_dbg_stats() -> bool:
     return _dsv41_os.environ.get("DSV41_DEBUG_STATS") == "1"
+
+
+import time as _dsv41_time
+
+
+def _dsv41_dbg_timing() -> bool:
+    return _dsv41_os.environ.get("DSV41_DEBUG_TIMING") == "1"
 
 
 def _dsv41_dbg_dump_dir() -> str:

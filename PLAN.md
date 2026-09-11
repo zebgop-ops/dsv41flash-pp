@@ -186,3 +186,13 @@ exact rows, 4.2 M rows/s warm.
 - 2026-09-10 23:55 PT — 30k needle RECALL OK (29,067 prompt tokens, 436 s, ~67 tok/s prefill). Bench C=4:
   15.8 tok/s aggregate (3.9/stream); single stream ~8 tok/s. DSpark stays off (no broadcast_drafts under PP
   in this image). Chat template has no thinking toggle; the model always emits reasoning (message.reasoning).
+- 2026-09-11 09:25 PT — /goal 16 tok/s. Findings: FULL_AND_PIECEWISE graphs = no gain (8.1); kt-kernel's AVX2
+  MXFP4 path is ~5.7 ms/layer-step regardless of threads (one thread per expert) -> replaced by
+  overlay/hybrid/cpu_moe.cpp (AVX2/OpenMP, exact vs torch, 2.4 ms/layer-step = 44 GB/s of a ~52 GB/s DRAM
+  ceiling; prefill 1.8 s per 2048-token chunk) -> 10.9 tok/s with 12 CPU layers. GPU device time ~27 ms/step
+  (in-worker torch profiler, DSV41_DEBUG_PROFILE=1; nothing pathological). Load-time HBM transient of the Marlin
+  MXFP4 repack (~6.7 GiB: raw+packed, refs pinned by caller frames) removed by staging the repack through host
+  RAM (overlay/hybrid/marlin_staged.py, bit-exact vs vLLM's prepare) -> 8 GPU-expert layers per rank fit:
+  partition 8,12,8,12, CPU layers 16-19,35-39 (9), util 0.97, KV 933k tokens. Pinned staging must be pageable
+  (torch caches pinned blocks -> host OOM). Autotune guard for Triton under capture (mqa_logits_triton.py) and
+  warmup for block 128. Worker debug hooks: DSV41_DEBUG_SYNC/TIMING/PROFILE.

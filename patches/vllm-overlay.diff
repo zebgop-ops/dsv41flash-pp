@@ -14,9 +14,54 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_e
      use_default_config = tile_n == 12 and n_thr == 512
      if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
          hc_prenorm_gemm_block_m_tilelang(
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/layers/quantization/mxfp4.py vllm/model_executor/layers/quantization/mxfp4.py
+--- image-official/model_executor/layers/quantization/mxfp4.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/model_executor/layers/quantization/mxfp4.py	2026-09-11 01:26:51.474956808 -0700
+@@ -717,8 +717,18 @@
+                     and w2_bias.shape[1] == hidden_size
+                 )
+ 
+-        # Convert weights to kernel format
+-        w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
++        # dsv41: staged marlin repack (no raw+packed HBM transient)
++        if self.mxfp4_backend == Mxfp4MoeBackend.MARLIN:
++            del w13, w2, w13_scale, w2_scale  # the layer keeps the only references
++            from hybrid.marlin_staged import prepare_marlin_mxfp4_moe_staged
++
++            prepare_marlin_mxfp4_moe_staged(layer)
++            w13, w2 = layer.w13_weight, layer.w2_weight
++            w13_scale, w2_scale = layer.w13_weight_scale, layer.w2_weight_scale
++            w13_bias = getattr(layer, "w13_bias", None)
++            w2_bias = getattr(layer, "w2_bias", None)
++        else:
++          w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
+             convert_weight_to_mxfp4_moe_kernel_format(
+                 mxfp4_backend=self.mxfp4_backend,
+                 layer=layer,
+@@ -774,17 +784,15 @@
+             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+ 
+     def process_weights_after_loading(self, layer):
+-        w13 = layer.w13_weight
+-        w2 = layer.w2_weight
+-        w13_scale = layer.w13_weight_scale
+-        w2_scale = layer.w2_weight_scale
+         w13_bias = getattr(layer, "w13_bias", None)
+         w2_bias = getattr(layer, "w2_bias", None)
+ 
+         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+             return
+ 
+-        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
++        # dsv41: pass the raw tensors without local references (see _setup_kernel)
++        self._setup_kernel(layer, layer.w13_weight, layer.w2_weight, layer.w13_weight_scale,
++                           layer.w2_weight_scale, w13_bias, w2_bias)
+ 
+     def get_fused_moe_quant_config(
+         self,
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/layers/sparse_attn_indexer.py vllm/model_executor/layers/sparse_attn_indexer.py
 --- image-official/model_executor/layers/sparse_attn_indexer.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/model_executor/layers/sparse_attn_indexer.py	2026-09-10 16:12:53.063287749 -0700
++++ vllm/model_executor/layers/sparse_attn_indexer.py	2026-09-11 00:45:46.435972484 -0700
 @@ -28,6 +28,7 @@
      fp8_fp4_mqa_logits,
      fp8_fp4_paged_mqa_logits,
@@ -296,7 +341,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_e
 +            _nh = num_heads if num_heads is not None else 32
 +            device = topk_indices_buffer.device
 +            warmup_fp8_mqa_logits_triton(_nh, head_dim, device)
-+            for _bs in sorted({64, 256, get_current_vllm_config().cache_config.block_size}):
++            for _bs in sorted({64, 128, 256, get_current_vllm_config().cache_config.block_size}):
 +                warmup_fp8_paged_mqa_logits_triton(_nh, head_dim, _bs, device)
 +
      @property
@@ -1521,8 +1566,8 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/atte
 +        return tl.load(lut_ptr + u.to(tl.uint32))
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/attention/ops/mqa_logits_triton.py vllm/v1/attention/ops/mqa_logits_triton.py
 --- image-official/v1/attention/ops/mqa_logits_triton.py	1969-12-31 16:00:00.000000000 -0800
-+++ vllm/v1/attention/ops/mqa_logits_triton.py	2026-09-10 15:51:03.851317573 -0700
-@@ -0,0 +1,453 @@
++++ vllm/v1/attention/ops/mqa_logits_triton.py	2026-09-11 00:25:06.282465948 -0700
+@@ -0,0 +1,485 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Triton fallback for DeepGEMM's fp8_mqa_logits / fp8_paged_mqa_logits."""
@@ -1557,6 +1602,38 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/atte
 +# NaN bytes pin to +-480 so a NaN cache entry cannot poison the whole
 +# logits row through the dot product.
 +_INDEXER_LUT_NAN_VALUE = 480.0
++
++
++# dsv41: capture-safe autotune. Under FULL cudagraph mode the whole decode
++# attention (this indexer kernel included) is captured; a Triton autotune key
++# that was not primed by the warmups would benchmark (device sync) inside the
++# capture and abort it (cudaErrorStreamCaptureUnsupported). When that happens,
++# take the configs in declared order instead of benchmarking and say so, so the
++# missing warmup can be added. The paged/prefill sweeps here only differ in
++# num_stages, so the first config is a sound choice.
++import triton.runtime.autotuner as _tt_autotuner
++from vllm.logger import init_logger as _dsv41_init_logger
++
++_dsv41_logger = _dsv41_init_logger(__name__)
++_dsv41_orig_bench = _tt_autotuner.Autotuner._bench
++
++
++def _dsv41_capture_safe_bench(self, *args, config, **kwargs):
++    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++        rank = self.configs.index(config) if config in self.configs else 0
++        if rank == 0:
++            _dsv41_logger.warning(
++                "Triton autotune for %s requested during CUDA graph capture; "
++                "using the first config without benchmarking (add a warmup for "
++                "this key)", getattr(self.base_fn, "__name__", "?"),
++            )
++        return [float(rank), float(rank), float(rank)]
++    return _dsv41_orig_bench(self, *args, config=config, **kwargs)
++
++
++if not getattr(_tt_autotuner.Autotuner, "_dsv41_capture_safe", False):
++    _tt_autotuner.Autotuner._bench = _dsv41_capture_safe_bench
++    _tt_autotuner.Autotuner._dsv41_capture_safe = True
 +
 +
 +def _get_e4m3fn_bf16_lut(device: torch.device) -> torch.Tensor:
@@ -2184,7 +2261,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
                  slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/worker/gpu_worker.py vllm/v1/worker/gpu_worker.py
 --- image-official/v1/worker/gpu_worker.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/v1/worker/gpu_worker.py	2026-09-10 23:19:04.154782651 -0700
++++ vllm/v1/worker/gpu_worker.py	2026-09-11 02:19:23.347011924 -0700
 @@ -99,6 +99,26 @@
  
  logger = init_logger(__name__)
@@ -2212,7 +2289,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
  
  def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
      spec_config = vllm_config.speculative_config
-@@ -1159,6 +1179,26 @@
+@@ -1159,6 +1179,27 @@
                  )
              }
  
@@ -2236,10 +2313,11 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
 +            except Exception:
 +                logger.error("DSV41 SYNC-BEFORE-IRECV failed (sticky error from the previous step)")
 +                raise
++            _dsv41_t0 = time.perf_counter()
          if forward_pass and not get_pp_group().is_first_rank:
              tensor_dict, comm_handles, comm_postprocess = (
                  get_pp_group().irecv_tensor_dict(
-@@ -1173,6 +1213,13 @@
+@@ -1173,20 +1214,57 @@
                  comm_postprocess=comm_postprocess,
              )
  
@@ -2249,10 +2327,64 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
 +            except Exception:
 +                logger.error("DSV41 SYNC-AFTER-IRECV failed (PP recv kernels faulted)")
 +                raise
-+            logger.info("DSV41 sync after irecv OK (tokens=%d)", scheduler_output.total_num_scheduled_tokens)
++            _dsv41_t1 = time.perf_counter()
++        _dsv41_prof = None
++        if os.environ.get("DSV41_DEBUG_PROFILE") == "1" and scheduler_output.total_num_scheduled_tokens == 1:
++            self._dsv41_pcount = getattr(self, "_dsv41_pcount", 0) + 1
++            if self._dsv41_pcount in (40, 41):
++                from torch.profiler import ProfilerActivity, profile as _tprofile
++                _dsv41_prof = _tprofile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
++                _dsv41_prof.__enter__()
          with self.annotate_profile(scheduler_output):
              output = self.model_runner.execute_model(
                  scheduler_output, intermediate_tensors
+             )
+-            if (
+-                self.use_v2_model_runner
+-                and self.model_runner.is_pooling_model
+-                and output is None
+-            ):
+-                output = self.model_runner.pool()  # type: ignore
+-            if isinstance(
+-                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+-            ):
+-                return output
++        if _dsv41_prof is not None:
++            torch.cuda.synchronize()
++            _dsv41_prof.__exit__(None, None, None)
++            if self._dsv41_pcount == 41:
++                ka = _dsv41_prof.key_averages()
++                rows = sorted(ka, key=lambda e: -getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)))
++                tot = sum(getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)) for e in ka
++                          if not getattr(e, "is_async", False))
++                lines = [f"DSV41 PROFILE rank {get_pp_group().rank_in_group} T=1 step: kernels by device time (us); "
++                         f"self-cpu total {sum(e.self_cpu_time_total for e in ka):.0f} us"]
++                for e in rows[:40]:
++                    dt = getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0))
++                    if dt <= 0:
++                        continue
++                    lines.append(f"  {dt:9.0f} us  n={e.count:4d}  {e.key[:110]}")
++                logger.info("\n".join(lines))
++        if _dsv41_sync:
++            torch.cuda.synchronize()
++            _dsv41_t2 = time.perf_counter()
++            self._dsv41_steps = getattr(self, "_dsv41_steps", 0) + 1
++            if scheduler_output.total_num_scheduled_tokens == 1 and self._dsv41_steps % 16 == 0:
++                logger.info("DSV41 STEP T=1 recv-wait %.2f ms forward %.2f ms",
++                            (_dsv41_t1 - _dsv41_t0) * 1e3, (_dsv41_t2 - _dsv41_t1) * 1e3)
++        if (
++            self.use_v2_model_runner
++            and self.model_runner.is_pooling_model
++            and output is None
++        ):
++            output = self.model_runner.pool()  # type: ignore
++        if isinstance(
++            output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
++        ):
++            return output
+ 
+         assert isinstance(output, IntermediateTensors)
+         parallel_config = self.vllm_config.parallel_config
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/worker/utils.py vllm/v1/worker/utils.py
 --- image-official/v1/worker/utils.py	2026-09-09 23:38:04.000000000 -0700
 +++ vllm/v1/worker/utils.py	2026-09-10 20:30:12.986768265 -0700

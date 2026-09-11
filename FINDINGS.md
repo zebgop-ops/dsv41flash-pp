@@ -82,7 +82,39 @@ rank 3 shadows kv source 20.
 - `DSV41_MEM_CAP_FRACTION=0.965` turns a near-top-of-card allocation into a clean OOM instead
   of an Xid-31 wedge that survives until reboot.
 
-## 5. Smaller upstream issues met on the way
+## 5. Getting from 8 to 16.7 tok/s (same outputs)
+
+- **Full CUDA graphs did nothing** (8.1 either way): GPU device time is only ~27 ms of the
+  step (in-worker `torch.profiler` via `DSV41_DEBUG_PROFILE=1`; this image has no
+  `/start_profile` route). Per-rank timing (`DSV41_DEBUG_SYNC=1`, `DSV41_DEBUG_TIMING=1`)
+  showed the CPU experts and the gaps around them were the rest.
+- **kt-kernel's AVX2 MXFP4 MoE is one thread per expert.** 5.7-5.8 ms per layer-step at 8,
+  16, 24 and 32 threads, linear in batch size: ~3 GB/s of packed weights per thread, compute-
+  bound in the nibble decode. `overlay/hybrid/cpu_moe.cpp` splits every expert's rows across
+  all threads (static schedule for decode so each thread streams contiguous rows, dynamic for
+  prefill), decodes E2M1 through a byte LUT with the ×2 folded into the E8M0 scale, and
+  accumulates in fp32: 2.4 ms per layer-step, ~44 GB/s against a measured ~52 GB/s DRAM
+  ceiling (`bw` test, 16 threads). Exact against the torch reference (cosine 0.999999, max
+  abs 1e-4 on outputs of magnitude 3e-3). 12 CPU layers: 10.9 tok/s.
+- **The Marlin MXFP4 repack needs raw + packed on the GPU at once.** `prepare_moe_mxfp4_layer_
+  for_marlin` builds the packed w13/w2 while the raw tensors are still referenced by the layer
+  and by two caller frames: ~6.7 GiB of transient per layer, which is what limited a rank to
+  7 expert layers (OOM at 62.4 GiB with 8). `overlay/hybrid/marlin_staged.py` copies the raw
+  tensor to host memory, drops the GPU copy, and packs expert by expert into the preallocated
+  output; `patch_marlin_staged.py` stops the callers from holding references. Bit-exact
+  against vLLM's own prepare (`test_marlin_staged.py`). Result: 8 expert layers per rank,
+  partition `8,12,8,12`, 9 CPU layers, 16.7 tok/s.
+- **Pinned staging is a trap.** The first staged boot used pinned host buffers; torch's
+  pinned allocator caches freed blocks for the life of the process, so each worker kept
+  ~6.7 GiB locked and the host OOM-killed worker 3. Pageable staging fixed it (peak 87 GB).
+- **Triton autotune under full-graph capture.** With `FULL_AND_PIECEWISE` the sparse
+  indexer's paged MQA-logits kernel is captured; one autotune key (block size 128, finalized
+  after the indexer's warmup ran with the placeholder 16) was missing, and the benchmark's
+  device sync invalidated the capture. The warmup now covers 128, and `mqa_logits_triton.py`
+  installs an `Autotuner._bench` guard that takes the first config (and logs the key) if a
+  benchmark is ever requested during capture.
+
+## 6. Smaller upstream issues met on the way
 
 - **KV-cache tensor builder under PP** (`patch_kv_groups.py`): a projected group with no local
   layers keeps the global `UniformTypeKVCacheSpecs`, and the builder iterated that dict and
@@ -108,6 +140,9 @@ rank 3 shadows kv source 20.
 | `DSV41_EXTRA_DOCKER="-e CUDA_LAUNCH_BLOCKING=1 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=0"` | synchronous launches; the exception is logged before the NCCL watchdog aborts |
 | `DSV41_DEBUG_STATS=1` | per-layer \|h\| / residual stats every step (each line syncs) |
 | `DSV41_DEBUG_DUMP=/dump`, `DSV41_DEBUG_DUMP_LAYERS=0,1,2` | attn/ffn input+output dumps for 1 < T ≤ 64 batches, plus per-stage attention dumps for `ktests/ref_stages.py` |
-| `DSV41_DEBUG_SYNC=1` | device syncs around the PP receive and per KV group in slot mapping; logs block-table geometry |
+| `DSV41_DEBUG_SYNC=1` | device syncs around the PP receive and per KV group in slot mapping; logs block-table geometry and per-step recv-wait/forward times |
+| `DSV41_DEBUG_TIMING=1` | per-layer wall time (with syncs) every 16th decode step |
+| `DSV41_DEBUG_PROFILE=1` | wraps the 41st decode step in `torch.profiler` and logs the top kernels by device time per rank |
+| `CPU_MOE_TRACE=1` | the native CPU kernel prints its phase times |
 | `DSV41_ENGRAM_ZERO=1` | Engram lookups return zeros (isolates the SSD path) |
 | `DSV41_MHC_TORCH=1` | torch mHC instead of tilelang |

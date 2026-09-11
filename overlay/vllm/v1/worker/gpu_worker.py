@@ -1199,6 +1199,7 @@ class Worker(WorkerBase):
             except Exception:
                 logger.error("DSV41 SYNC-BEFORE-IRECV failed (sticky error from the previous step)")
                 raise
+            _dsv41_t0 = time.perf_counter()
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
@@ -1219,21 +1220,51 @@ class Worker(WorkerBase):
             except Exception:
                 logger.error("DSV41 SYNC-AFTER-IRECV failed (PP recv kernels faulted)")
                 raise
-            logger.info("DSV41 sync after irecv OK (tokens=%d)", scheduler_output.total_num_scheduled_tokens)
+            _dsv41_t1 = time.perf_counter()
+        _dsv41_prof = None
+        if os.environ.get("DSV41_DEBUG_PROFILE") == "1" and scheduler_output.total_num_scheduled_tokens == 1:
+            self._dsv41_pcount = getattr(self, "_dsv41_pcount", 0) + 1
+            if self._dsv41_pcount in (40, 41):
+                from torch.profiler import ProfilerActivity, profile as _tprofile
+                _dsv41_prof = _tprofile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+                _dsv41_prof.__enter__()
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
-            if (
-                self.use_v2_model_runner
-                and self.model_runner.is_pooling_model
-                and output is None
-            ):
-                output = self.model_runner.pool()  # type: ignore
-            if isinstance(
-                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
-            ):
-                return output
+        if _dsv41_prof is not None:
+            torch.cuda.synchronize()
+            _dsv41_prof.__exit__(None, None, None)
+            if self._dsv41_pcount == 41:
+                ka = _dsv41_prof.key_averages()
+                rows = sorted(ka, key=lambda e: -getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)))
+                tot = sum(getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)) for e in ka
+                          if not getattr(e, "is_async", False))
+                lines = [f"DSV41 PROFILE rank {get_pp_group().rank_in_group} T=1 step: kernels by device time (us); "
+                         f"self-cpu total {sum(e.self_cpu_time_total for e in ka):.0f} us"]
+                for e in rows[:40]:
+                    dt = getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0))
+                    if dt <= 0:
+                        continue
+                    lines.append(f"  {dt:9.0f} us  n={e.count:4d}  {e.key[:110]}")
+                logger.info("\n".join(lines))
+        if _dsv41_sync:
+            torch.cuda.synchronize()
+            _dsv41_t2 = time.perf_counter()
+            self._dsv41_steps = getattr(self, "_dsv41_steps", 0) + 1
+            if scheduler_output.total_num_scheduled_tokens == 1 and self._dsv41_steps % 16 == 0:
+                logger.info("DSV41 STEP T=1 recv-wait %.2f ms forward %.2f ms",
+                            (_dsv41_t1 - _dsv41_t0) * 1e3, (_dsv41_t2 - _dsv41_t1) * 1e3)
+        if (
+            self.use_v2_model_runner
+            and self.model_runner.is_pooling_model
+            and output is None
+        ):
+            output = self.model_runner.pool()  # type: ignore
+        if isinstance(
+            output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+        ):
+            return output
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
