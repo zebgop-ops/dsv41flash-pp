@@ -1,0 +1,188 @@
+# DeepSeek-V4.1-Flash on 4x CMP 170HX — plan (2026-09-10)
+
+Goal: serve deepseek-ai/DeepSeek-V4.1-Flash (native FP8 dense / MXFP4 experts / FP8 Engram)
+on this box, with the cold layers' experts computed in CPU RAM and the Engram tables on SSD.
+
+## Facts that drive the design
+- Checkpoint: 475 GiB, 48 shards. Backbone ~284 GiB (40 x 6.72 GiB MXFP4 experts + 0.12 GiB
+  attention per layer, DSpark 6.5 GiB, embed/head 2.5 GiB, vision 0.8 GiB). Engram = 2 tables
+  (layers 1 and 14), 384M rows x 256 FP8 + [rows,8] UE8M0 scales = 94.6 GiB each (shards 47/48).
+- Box: 4 x CMP 170HX 64 GiB (sm_80, PCIe Gen2 x4, no P2P; keep PyTorch peak <= ~61.5 GiB/card),
+  123 GB RAM (qwen38 currently holds ~70 GB of it), 1.8 TB free on the NVMe (990 PRO).
+  => ~218 GiB of weights fit on GPUs after KV/activations => ~10 layers of experts (~67 GiB)
+  must live in CPU RAM; Engram (189 GiB) cannot be in RAM => SSD + page cache.
+- vLLM: model definitions merged (PR #56228), frontend merged (#56208), umbrella PR #56214
+  (kernels, config/engram.py, engine args) open; official image vllm/vllm-openai:deepseekv41-flash-0909
+  exists. Attention backends in the PR: FlashMLA (sm90/100), FlashInfer (sm120), ROCm/Triton.
+  No Ampere path. V4 got its Ampere path from haosdent/vllm@f8ea5bb by subclassing the ROCm
+  Triton sparse-MLA attention + fp8_sm80 LUT helpers (that is what runs DSv4 here today).
+- PR engram: ParallelEngramEmbedding(cpu_offload=True) keeps the shard in pinned host memory
+  and gathers over UVA. Not viable at 189 GiB on a 123 GB host.
+- CPU experts: KT-Kernel (pip kt-kernel 0.7.0.post2, cp312) has a native AVX2 MXFP4 MoE
+  backend (operators/avx2/mxfp4-moe.hpp) and an MXFP4SafeTensorLoader that reads the V4/V4.1
+  layout `layers.N.ffn.experts.E.w{1,3,2}.{weight,scale}` straight from the HF shards.
+  Zen3 (5955WX) = AVX2+FMA, no AVX-512.
+- Reference NVMe Engram design: 0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000 (MIT):
+  row_store.cpp = direct-mapped bounded RAM cache + O_DIRECT pread from the safetensors shard,
+  called via cudaLaunchHostFunc so it works inside CUDA graphs.
+
+## Stack decision: vLLM image + Python overlay (same pattern as glm53-run / qwen38-run)
+1. Base: vllm/vllm-openai:deepseekv41-flash-0909 (check sm_80 in its arch list first).
+2. Overlay A — Ampere attention for deepseek_v4_1: subclass DeepseekV41ROCMAiterMLAAttention
+   (Triton sparse MLA prefill/decode, bf16 o_proj) as in f8ea5bb's ampere_sparse.py; port
+   fp8_sm80.py (LUT decode / RNE encode) into every Triton kernel that converts fp8 on the
+   V4.1 path (rocm_aiter_mla_sparse.py, v4_1/common/ops/cache_utils.py,
+   fused_compress_quant_cache.py, indexer_k_store.py, engram lookup); Triton mqa-logits
+   indexer fallback (mqa_logits_triton.py + sparse_attn_indexer.py hunks, + 0005a/0006
+   torch top-k fallback and row chunking); indexer K cache FP8 (not MXFP4); gate
+   `_select_dsv4_attn_cls` on capability.major == 8.
+3. Overlay B — Engram on SSD: new storage mode for ParallelEngramEmbedding: hash ids -> host
+   callback (cudaLaunchHostFunc) -> row_store (pread from shard 47/48 + bounded RAM cache)
+   -> pinned rows/scales -> H2D -> dequant on GPU (torch fp8->bf16, e8m0 scale).
+4. Overlay C — CPU experts for the cold layers: HybridMoE for the configured layer set:
+   GPU router (select_experts) -> KT-Kernel KTMoEWrapper(method="MXFP4") for CPU experts
+   (optionally a hot subset on GPU via gpu_experts_mask) -> shared expert on GPU. vLLM must
+   skip loading those layers' expert weights to GPU.
+5. Overlay D — PP4 with cache sharing across ranks: V4.1 consumers read the compressed KV /
+   indexer K caches of their kv-source layer (2, 8, 14, 20) through the forward context on the
+   SAME rank ("PP splits inside a kv-sharing group are not supported"). The decoder group
+   (layers 20-39, 138 GiB) cannot sit on one card, so a receiving rank gets a shadow copy of
+   the source layer's compressor(+indexer K store) fed by the source layer's attention input
+   shipped in IntermediateTensors, plus the candidate block buffer of layer 20.
+6. DSpark spec-decode later (upstream now has broadcast_drafts under PP).
+
+## Blockers needing the user
+- Host NVIDIA userland is 610.57.04 but the loaded kernel module is 610.43.02
+  (/var/run/reboot-required exists): every NEW CUDA container fails to init. Reboot needed.
+- All four GPUs and ~70 GB RAM are held by qwen38-pp (Up 4 days). It has to be stopped.
+
+## Status log
+- 2026-09-10 15:20 download started: hf download deepseek-ai/DeepSeek-V4.1-Flash (log dl-v41.log)
+- 2026-09-10 15:50 docker pull vllm/vllm-openai:deepseekv41-flash-0909 (log pull-image.log)
+
+## PP4 layout (decided 2026-09-10, after reading attention.py/compressor.py)
+Consumers find their kv-source's compressed-KV cache and indexer K cache through
+`static_forward_context[<source attn prefix>]` on the same rank. Index sources at
+24/28/32/36 do not own K (they share kv source 20's K cache) and later indexers mask with
+the candidate blocks published by layer 20.
+=> Legal cut points without shadows: 2, 8, 14, 20. With a "shadow source" on the receiving
+rank: any index-source boundary (24, 28, 32, 36).
+Shadow source = the kv-source layer's attention module instantiated again on the next rank
+(0.13 GiB), registered under the source's prefixes so the KV-cache manager allocates its
+compressed KV / compressor state / indexer K caches there, and driven each step by the
+source layer's post-norm attention input shipped in IntermediateTensors (bf16 [T,5120]):
+kv_score GEMM -> compressor.forward -> insert_cache -> indexer._produce_k. The candidate
+block buffer of layer 20 ([T,2048] int32) is shipped the same way.
+Partition: R0 0-7 (8 layers, 54 GiB + embed) | R1 8-13 (40 GiB) | R2 14-23 (10 layers; experts
+of 22-23 on CPU -> 54 GiB) | R3 24-39 (16 layers; experts of 8 of them on CPU -> 54 GiB,
++ lm_head 1.2 + DSpark 6.5 later). CPU experts total 10 layers = 67 GiB.
+
+## Engram SSD backend — implemented (overlay/engram_ssd)
+row_store.cpp (thread pool, pread through the page cache) + engram_ssd.py
+(cudaLaunchHostFunc callback, pinned staging, torch fp8/e8m0 dequant). CPU test:
+exact rows, 4.2 M rows/s warm.
+
+## CPU experts — kt-kernel 0.7.0.post2 imports under the image's torch 2.13
+(needs gguf/typer/rich; ext exposes AVX2MXFP4_MOE, selected automatically on this Zen3).
+- kt-kernel AVX2 MXFP4 (CPU-only test, 16 threads, while qwen38 was serving): correct vs torch
+  reference (rel err 0.3%); V4.1 shape E=384/H=5120/I=2304/top-6: M=1 5.35 ms per layer-step,
+  M=4 15.4 ms, M=32 125 ms (~19-26 GiB/s weight traffic; 32 threads is slower than 16).
+  => 10 CPU layers cost ~55 ms/token at batch 1 -> decode ceiling ~15-18 tok/s from the CPU
+  side; DSpark verification batches (M=6) cost ~20 ms/layer-step, so spec decode helps.
+
+## Ampere overlay — work items (status 2026-09-10 evening)
+- [x] overlay/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py (subclass of the PR's ROCm Triton attention)
+- [x] patch_select_attn.py (SM8x -> Ampere class), patch_registry.py (TRITON_MLA_SPARSE_DSV41 / TRITON_SPARSE_SWA_DSV41)
+- [x] patch_v41_ops_fp8.py (cache_utils / fused_compress_quant_cache / indexer_k_store encode+decode via fp8_sm80)
+- [x] fp8_sm80.py + mqa_logits_triton.py staged into overlay/vllm/v1/attention/ops/
+- [x] rocm_aiter_mla_sparse.py: patch_rocm_sparse_lut.py (regex port of the f8ea5bb hunks; dry-run on main OK)
+- [x] sparse_attn_indexer.py: patch_indexer.py (Triton fallback, torch top-k, row chunking default 64, persistent_topk SM90 gate; dry-run on main OK). NOTE: V4.1 attention.py must pass num_heads=self.n_head to SparseAttnIndexer for the autotune warmup
+- [x] fused_indexer_q.py: patch_fused_indexer_q.py (software encode, uint8 warmup/launch pointer, CuTe DSL gate) -- dry-run on main OK
+- [x] CuTe DSL gates are local helpers in the patched files (main has no is_cutedsl_supported); patch_misc_sm80.py = tilelang prenorm torch fallback + execute_in_parallel capture guard (both still missing on main)
+- [x] wo_a: Ampere class keeps is_bmm=True -> init_mxfp8_linear_kernel(bmm) picks EmulationMxfp8LinearKernel below SM90 (bf16 dequant at load, +0.09 GiB/layer); _o_proj drops any leftover weight_scale_inv so the bf16 einsum cache is exact. No Marlin exemption needed.
+- [ ] engram.py: patch_engram.py (SSD storage) -- written, validated on the PR-head copy
+- [x] PP shadow sources: overlay/hybrid/pp_shadow.py + patch_pp_shadow.py (plan per rank from get_pp_indices, ShadowSource under the source prefix, shipped attention inputs + candidate blocks in IntermediateTensors, loader remap) -- drafted, untested
+- [x] CPU experts: overlay/hybrid/cpu_experts.py + patch_cpu_experts.py (meta-device routed experts for DSV41_CPU_EXPERT_LAYERS, loader skip, MoERunner._forward_impl override, kt-kernel load after GPU load) -- drafted, untested
+- [ ] DSpark under PP (upstream has broadcast_drafts now; verify in image)
+
+## Image facts (vllm/vllm-openai:deepseekv41-flash-0909, inspected 2026-09-10 16:15)
+- vllm 0.1.dev20904+g179dd0fa9, Python 3.12, torch 2.13 cu130, triton 3.7.1, tilelang 0.1.12, flashinfer 0.6.18,
+  cutlass-dsl 4.6.2; NO deep_gemm (Triton indexer fallback is mandatory anyway).
+- Compiled arch list includes sm_80 (_C_stable_libtorch + _moe_C); the fused V4 KV-insert kernel is in the .so.
+- --engram-config wired (EngramConfig.cpu_offload); image engram.py has DP head-sharding (patch re-anchored).
+- Engram lookback ids are handled by the V1 runner only (v1/worker/gpu_model_runner.py); V2 runner
+  (default here) has no engram support -> launcher sets VLLM_USE_V2_MODEL_RUNNER=0.
+- No broadcast_drafts in v1/worker/gpu/pp_utils.py -> DSpark under PP unsupported in this image; SPEC off.
+- Overlay applies cleanly: 43 files (overlay/vllm), all parse.
+
+## Boot log (2026-09-10 evening, GPUs free after reboot + user stopped qwen38)
+- boot 1: pinned staging buffers created under the cuda default-device context (fixed: explicit cpu device);
+  rank 1 loader died in safetensors get_tensor (now skipped via DSV41_SKIP_WEIGHT_RE for engram tables +
+  CPU-layer experts); rank 3 built consumers before the shadow source (fixed: shadow before make_layers,
+  remap adds `.attn`). Stray root-owned deep_gemm in kt/site removed.
+- boot 2: kt-kernel loaded CPU experts fine (ranks 2/3); rank 0 OOM in Marlin MXFP4 repack at 62.4 GiB with
+  8 GPU layers (54 GiB experts + ~4.5 GiB repack transient). Rule: <= 7 GPU expert layers per rank.
+  CPU set now 7,21-23,31-39 (13 layers, ~87 GiB RAM), util 0.92.
+- boot 3: rank 0 loaded in 97 s at 51.67 GiB; MoERunner read quant_method.skip_forward_padding on the CPU-expert
+  stub -> stub now carries a quant-method proxy (attributes delegated, no-op post-load).
+- boot 4: SharedExperts wrapper only computes for its kernel's order -> CPU path runs the shared MLP directly.
+- boot 5: profiling forward passed on all ranks (CPU experts, shadow source, Engram-SSD all executed);
+  KV sized to 334,778 tokens at 131k (2.44 GiB on rank 0). Rank 3 died allocating KV: upstream bug --
+  a projected KV group with no local layers keeps the global UniformTypeKVCacheSpecs dict and the tensor
+  builder iterated it (compressor ring buffers of layers 2/8/14). patch_kv_groups.py filters by the
+  group's own layer names. Instrumented v1/worker/utils.py names orphaned layers.
+- boot 6: **server reached "Application startup complete"** (GPUs 55.8/46.5/55.5/58.8 GiB, KV 334,778 tokens,
+  piecewise graphs captured), but the first request hung until the 300 s sample_tokens RPC timeout. Host RAM was
+  124 GB used + 6.8 GB swap: kt-kernel keeps TWO host copies per CPU layer (Python loader tensors + C++ aligned
+  buffers) = 13.4 GiB x 13 layers. Fix: cpu_experts.load_weights drops the Python-side lists after load.
+  --max-num-batched-tokens lowered to 2048.
+- boot 7: python copies freed; host RSS = 8.3 GB per CPU layer (fp4 + fp32-converted scales) + ~1.5 GB per
+  worker; 13 layers still swapped (121 GB used). Shadow mechanism generalized to INDEX sources (the shadow
+  replays the source's indexer top-k), so cuts are no longer restricted -> partition 7,7,10,16, CPU layers
+  21-23,31-39 (12 layers, ~100 GB). Rank 1 shadows layer 2 (top-k), rank 3 shadows layer 20 (caches only).
+- boot 8 (7,7,10,16): up, KV 749,878 tokens (5.7x @131k), RAM 112 GB used / 14 GB available. First request
+  hung: rank 0 raised in the DSA indexer metadata builder -> DeepGEMM get_paged_mqa_logits_metadata
+  ("Unsupported architecture"): mla/indexer.py gated on has_deep_gemm() (package present in the image);
+  patch_mla_indexer.py switches all 4 sites to is_deep_gemm_supported(). The engine did not die on the
+  worker exception (other ranks waited on the PP recv) -> requests time out at 300 s instead.
+- boot 10 (graphs off): **first completed request** (HTTP 200, 32 tok in 13.6 s) but text is garbage.
+  Bisection so far (all on GPU 0, real weights): dense MXFP8 Marlin exact (0.14%), Marlin MXFP4 MoE exact
+  (0.6%, clamp ok), kt-kernel CPU experts exact incl. swiglu clamp, Engram SSD rows exact + graph replay,
+  fp8 sm80 helpers bit-exact, Triton MQA logits + sparse decode/prefill kernels pass (V4 tests, with the
+  V4 cache module patched for the tests), V4.1 cache quantize/dequantize round-trip ok, mHC tilelang
+  (delayed pre / post / broadcast) exact vs torch. Engram-zero run: still garbage. No-index-shadow
+  partition (8,6,10,16): still garbage. Raw /v1/completions garbage too (tokenizer sane).
+  Remaining suspects: V4.1 attention/indexer *integration* on the Triton path, kv-shadow (rank 3),
+  kt integration inside the MoE runner. Tools added: DSV41_DEBUG_STATS=1 (per-layer |h| stats),
+  DSV41_MHC_TORCH=1 (torch mHC), DSV41_ENGRAM_ZERO=1.
+- Further bisection (all pass): inverse RoPE Triton vs rotary native (needs a set_current_vllm_config
+  fixture), CUDA fused Q/KV RoPE+UE8M0 insert op round-trip (Q inverse exact-ish, K dequant matches
+  native RoPE), hc_collapse Triton, mHC tilelang vs torch, sparse decode/prefill Triton kernels.
+  Per-layer |h| stats: bounded, no NaN, smooth growth. Prompt logprobs are wrong from position 1
+  (after BOS alone) => per-token pipeline is wrong, not context attention.
+  Next: torch oracle for block 0 (ktests/ref_layer0.py, built from DeepSeek's inference/model.py
+  semantics) vs vLLM activation dumps (DSV41_DEBUG_DUMP=/dump; only short real batches).
+- 2026-09-10 22:30 PT — ROOT CAUSE of garbage output (stage oracle ktests/ref_stages.py on
+  DSV41_DEBUG_DUMP stage dumps from ampere_sparse.py): every attention stage matches the torch
+  reference (q/kv projections+norms cos 1.0000, fused RoPE insert 1.0000, gathered fp8 K rows
+  0.9998, Triton sparse prefill kernel vs attend(vLLM q, vLLM K) 1.0000) except the o_proj:
+  the MXFP8 *emulation* kernel dequantizes wo_a to bf16 at load but leaves `weight_scale` on
+  the layer, and the ROCm `_get_cached_wo_a_bf16` multiplies the bf16 weight by that E8M0 scale
+  a second time -> o_proj output ~2^-11 too small and block-wise distorted (cos 0.92, mean
+  |out| 0.00019 vs 0.63). Fix: DeepseekV41AmpereMLAAttention._o_proj installs
+  `wo_a._dsv4_wo_a_bf16` from the bf16 weight directly (no scale). Re-verifying.
+- 2026-09-10 23:30 PT — wo_a fix verified: layer-0 o_proj cos 1.0000, layer-1 attention cos 0.9999, chat answers
+  correct (391, Canberra, Paris). Second bug (prompts >= ~2k tokens crash rank 2 with Xid 31 MMU fault):
+  bracketed with DSV41_DEBUG_SYNC=1 (per-group slot-mapping syncs in gpu_worker.py) -> the generic
+  token->slot kernel faults on kv-cache group 5 = the compressor CircularBufferSpec ring (block_size 8,
+  1 block/req, table padded to 16 cols): it reads block_table[req, pos//8] far past the row. The V2 runner
+  disables slot mapping for CircularBufferSpec; the V1 runner (needed for Engram lookback) does not ->
+  new overlay/patch_v1_circular.py on v1/worker/gpu_model_runner.py (SlotMappingMode.NONE for ring groups).
+  NCCL standalone pipeline send/recv (up to 512 MB/hop) is fine; launcher gained DSV41_EXTRA_DOCKER.
+- 2026-09-10 23:45 PT — WORKING with CUDA graphs (PIECEWISE): plen 1965 tokens OK ("240" correct), smoke OK
+  (391 / Canberra), needle 5.5k RECALL OK; decode 8.1 tok/s (graphs) vs ~5 eager; prefill ~62 tok/s at 5.5k.
+  kt capture-size registration held up under graph replay (no repeat of the worker-2 segfault).
+  Open: CPU thread tuning (DSV41_CPU_EXPERT_THREADS), DSpark spec decode, 30k needle (running), perf.
+- 2026-09-10 23:55 PT — 30k needle RECALL OK (29,067 prompt tokens, 436 s, ~67 tok/s prefill). Bench C=4:
+  15.8 tok/s aggregate (3.9/stream); single stream ~8 tok/s. DSpark stays off (no broadcast_drafts under PP
+  in this image). Chat template has no thinking toggle; the model always emits reasoning (message.reasoning).

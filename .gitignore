@@ -1,0 +1,10 @@
+*.log
+__pycache__/
+*.pyc
+*.so
+*.pt
+dump/*
+!dump/.gitkeep
+overlay/image-official/
+kt/site/
+kt/wheel/
