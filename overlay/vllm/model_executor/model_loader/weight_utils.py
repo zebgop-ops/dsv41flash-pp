@@ -841,7 +841,12 @@ _DSV41_SKIP_RE = (
 )
 
 
+_DSV41_ONLY_RE = None  # set transiently by hybrid/dspark_proposer.py around the draft load
+
+
 def _dsv41_skip(name: str) -> bool:
+    if _DSV41_ONLY_RE is not None and _DSV41_ONLY_RE.search(name) is None:
+        return True
     return _DSV41_SKIP_RE is not None and _DSV41_SKIP_RE.search(name) is not None
 
 

@@ -683,6 +683,12 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_dspark():
+                # dsv41 dspark: V1-runner port of the V2 DSpark speculator
+                from hybrid.dspark_proposer import DSparkProposer
+
+                self.drafter = DSparkProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -4086,11 +4092,12 @@ class GPUModelRunner(
             and (num_tokens == max_num_scheduled_tokens * num_reqs)
         ):
             return True
-        # dsv41 q1: draft-less steps under spec decode are uniform with query length 1
+        # dsv41 qall: any uniform query length below K+1 (draft-less steps, partially kept
+        # drafts) dispatches to its own FULL family
         return (
             uniform_decode_query_len > 1
-            and max_num_scheduled_tokens == 1
-            and num_tokens == num_reqs
+            and 1 <= max_num_scheduled_tokens < uniform_decode_query_len
+            and num_tokens == max_num_scheduled_tokens * num_reqs
             and os.environ.get("DSV41_FULL_Q1", "1") == "1"
         )
 
@@ -5742,6 +5749,17 @@ class GPUModelRunner(
             if eagle_config and isinstance(eagle_config, dict):
                 layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
 
+        if not layer_ids:
+            # dsv41 dspark: v4.1 reads the attention *inputs* of its target layers and the
+            # model captures the entry stream of layer L when idx + 1 == L (ids as-is);
+            # v4 ids are capture-after and keep the +1 (mirrors V2 eagle3_utils).
+            dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
+            if dspark_layer_ids:
+                if getattr(hf_config, "model_type", None) == "deepseek_v41":
+                    layer_ids = list(dspark_layer_ids)
+                else:
+                    layer_ids = [i + 1 for i in dspark_layer_ids]
+
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
 
@@ -6389,7 +6407,7 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            if self.speculative_config and self.drafter is not None and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -7381,7 +7399,7 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
+        if self.speculative_config and self.drafter is not None and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
@@ -7443,7 +7461,7 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
+        if self.speculative_config and self.drafter is not None and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
             or self.speculative_config.uses_extract_hidden_states()

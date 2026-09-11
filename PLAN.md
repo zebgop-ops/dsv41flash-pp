@@ -269,3 +269,31 @@ exact rows, 4.2 M rows/s warm.
   K=2 tied on prose (14.3) and lost on code (14.3 vs 15.3). DSV41_SPEC=0 restores the no-spec path unchanged.
   Repo dsv41flash-pp updated (patches, tools, FINDINGS §7, RESULTS spec table, README); servers-top/web notes
   updated (servers-web.service restart is the user's call).
+- 2026-09-11 22:55 PT — DSPARK on the V1 runner under PP4 WORKS (overlay/hybrid/dspark_proposer.py +
+  patch_dspark_v1.py; launcher DSV41_SPEC_METHOD=dspark -> K=5, CPU layers 16-19,33-39 so the 7.4 GiB draft +
+  1 GiB embedding fit on rank 3). Port: DFlashProposer subclass with the anchor-first N-query layout, sequential
+  Markov sampling (greedy), per-kv-group slot mappings/metadata (the hybrid manager puts each draft SWA cache in
+  its own group), mtp.*-only checkpoint read (weight_utils _DSV41_ONLY_RE), embed.weight loaded from shard 2 on
+  rank 3, lm_head aliased, draft_parallel_config pp=1, V1 "unsupported: dspark" check bypassed, async scheduling
+  off under PP (the [num_reqs,1] broadcast assert), eagle-family runner gates guarded for ranks without a drafter,
+  DFlash's non-causal metadata assert dropped (sparse-SWA handles causal=False internally). First numbers:
+  lpcheck text same (0.5-0.9 nats at later positions = 6-row numerics); code-edit 98% accepted (4.91/step) but
+  14.0 tok/s incl. prefill; prose 26% accepted (1.38/step, pos0 68% then 36/20/10/4%) 8.3 tok/s: a DSpark step
+  costs ~265 ms (n-gram 6-row step 140 ms). Next: phase timing of the draft, confidence-based adaptive
+  truncation (variable-length drafts through the sync scheduler path), CUDA graphs for the draft.
+- 2026-09-11 23:30 PT — DSpark tuning. Draft cost is ~10 ms/step (inputs+meta 4.9, ctx insert 0.7, forward 1.9
+  in a piecewise graph, Markov sampling 2.3). Confidence-based adaptive truncation added (cumulative confidence
+  >= tau, variable-length drafts through the synchronous scheduler path; /dump/dspark_conf overrides
+  DSV41_DSPARK_CONF at runtime) and FULL graph families for every query length 1..K (patch_full_qall; capture
+  sizes 1,2,3,4,5,6,8,10,12,18,24 -> 20 FULL graphs). 300-token streaming, thinking off:
+  prose tau 0/0.3/0.5/0.7: 47.9(400tok)/23.4/25.5/22.2 s (no-spec ~18 s, n-gram ~20 s);
+  code-edit (copy from prompt): 20.5-24.3 s incl. ~9.5 s prefill (54 steps, 5.56 tok/step);
+  FRESH code (LRU cache + tests, nothing to copy): 300 tokens in 15.1-15.3 s, 57-59 steps, 85% of drafts
+  accepted = ~20 tok/s vs 16.7 no-spec / ~16 n-gram. A 6-row DSpark verify step costs ~260 ms vs ~140 ms for the
+  n-gram K=5 shape (2 extra CPU layers ~+24 ms, draft +10 ms; ~85 ms unexplained -> tracing).
+- 2026-09-11 23:55 PT — DSpark kept as an opt-in mode (DSV41_SPEC_METHOD=dspark, conf 0.7): fresh code +20%
+  (~20 tok/s), copy-heavy code ~= n-gram, prose -15%. Cross-rank trace of a 6-row step: rank1 ~95 ms, rank3
+  ~155 ms = CPU-expert layers at ~20 ms each (≈40 distinct experts/layer, DRAM-bound); moving the draft experts
+  to CPU to free a target layer nets zero. Production rebooted on n-gram defaults and re-verified (lpcheck 0.000,
+  code-edit identical, 14.8 tok/s incl. prefill; capture sizes now 1,2,3,4,6,8,12,16 with q=1..3 FULL families).
+  Repo updated (dspark_proposer.py, patch_dspark_v1, patch_full_qall, FINDINGS §8, RESULTS DSpark table).

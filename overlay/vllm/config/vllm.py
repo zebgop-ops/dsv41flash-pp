@@ -67,6 +67,13 @@ else:
 
 logger = init_logger(__name__)
 
+
+def _dsv41_dspark_v1() -> bool:
+    """dsv41 dspark: the overlay ports DSpark to the V1 runner (hybrid/dspark_proposer.py)."""
+    import os
+
+    return os.environ.get("DSV41_DSPARK_V1", "1") == "1"
+
 # TODO(rocm): These models are either unsupported by MRV2 or slower with
 # MRV2 on AMD GPUs.
 ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset(
@@ -1304,6 +1311,17 @@ class VllmConfig:
                 # impacts performance of pooling models, so we disable by default.
                 logger.debug(
                     "Disabling asynchronous scheduling by default for pooling model."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
+                self.speculative_config is not None
+                and self.speculative_config.method == "dspark"
+                and self.parallel_config.pipeline_parallel_size > 1
+            ):
+                # dsv41 dspark: async scheduling under PP needs [num_reqs, 1] sampled
+                # ids; the drafted [num_reqs, K+1] path is handled synchronously
+                logger.warning_once(
+                    "Async scheduling disabled for dspark under pipeline parallel."
                 )
                 self.scheduler_config.async_scheduling = False
             elif (
@@ -2658,7 +2676,7 @@ class VllmConfig:
 
         # DSpark is implemented only by the V2 GPU model runner.
         if self.speculative_config:
-            if self.speculative_config.method == "dspark":
+            if self.speculative_config.method == "dspark" and not _dsv41_dspark_v1():
                 unsupported.append("dspark speculative decoding")
             if self.speculative_config.enable_adaptive_verification:
                 unsupported.append("adaptive draft verification")

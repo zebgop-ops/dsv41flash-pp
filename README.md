@@ -55,7 +55,8 @@ bind-mount. Knobs: `DSV41_PARTITION` (default `8,12,8,12`), `DSV41_CPU_EXPERT_LA
 (`16-19,35-39`), `DSV41_CPU_MOE` (`native` | `kt`), `DSV41_CPU_EXPERT_THREADS` (16, one per
 physical core), `DSV41_ENGRAM_STORAGE` (`ssd`), `DSV41_MAXLEN` (131072), `DSV41_SEQS`,
 `DSV41_UTIL` (0.97), `DSV41_SPEC` (n-gram speculative tokens per step, default `3`; `0` = off;
-`DSV41_NGRAM_MIN` 5 / `DSV41_NGRAM_MAX` 8), `DSV41_CG` (`FULL_DECODE_ONLY` without speculation,
+`DSV41_NGRAM_MIN` 5 / `DSV41_NGRAM_MAX` 8; `DSV41_SPEC_METHOD=dspark` for the checkpoint's own
+drafter, FINDINGS.md §8), `DSV41_CG` (`FULL_DECODE_ONLY` without speculation,
 `FULL_AND_PIECEWISE` with it; `NONE` for diagnostics), `DSV41_GPUS`, `DSV41_EXTRA_ARGS`,
 `DSV41_EXTRA_DOCKER` (e.g. `"-e CUDA_LAUNCH_BLOCKING=1"`), and the diagnostic switches in
 [FINDINGS.md](FINDINGS.md). It pre-flights the checkpoint, the
@@ -126,6 +127,12 @@ that produced it.
    piecewise graphs (`patch_full_q1.py` adds q=1 FULL graphs). Logprobs equal eager; the
    code-edit output is identical with and without speculation. The remaining cost of a
    draft-less step (~65 vs ~58 ms) is vLLM disabling async scheduling for CPU n-gram.
+9. **DSpark, the checkpoint's own drafter, on the V1 runner** (FINDINGS.md §8). The image has
+   it only for the V2 runner (no Engram there); `overlay/hybrid/dspark_proposer.py` ports the
+   V2 speculator onto V1's DFlash machinery with per-KV-group metadata, PP-aware loading and
+   confidence-truncated drafts. It works and accepts 85% of drafts on fresh code (+20%), but a
+   6-row verify step streams ~40 experts per CPU layer from host RAM, so prose loses; n-gram
+   stays the default.
 
 ## Layout
 

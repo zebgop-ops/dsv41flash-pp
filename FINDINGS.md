@@ -198,6 +198,45 @@ batch-invariant (`tools/batchinv.py`: concurrent vs sequential prefill differs b
 on tail tokens with the same top-1). The deviations sit inside that envelope; rejection sampling
 keeps the accepted tokens exactly those the 1+K-row verify pass would have sampled.
 
+## 8. DSpark on the V1 runner (works; pays only on fresh code here)
+
+DeepSeek-V4.1-Flash ships its own drafter: three MTP layers (`mtp.0-2`, 7.4 GiB in MXFP4 with 128
+experts each) that draft a block of 5 tokens in one parallel pass and then sample them left to
+right with a small Markov head. The image implements it only for the V2 model runner, and the V2
+runner has no Engram lookback, which is why this port runs on V1. `overlay/hybrid/dspark_proposer.py`
+subclasses V1's `DFlashProposer` and adds the DSpark specifics from the V2 speculator:
+
+- anchor-as-first-prediction layout (N queries per request, every position sampled) instead of
+  DFlash's 1+N with N mask slots;
+- sequential Markov sampling (greedy) plus the checkpoint's confidence head, used for
+  *adaptive truncation*: the draft is cut at the first position whose cumulative acceptance
+  confidence drops below `DSV41_DSPARK_CONF` (0.7 by default; `/dump/dspark_conf` changes it at
+  runtime), and the synchronous PP scheduler path simply verifies that many tokens, so
+  low-confidence steps stay 1-2 rows;
+- per-KV-group slot mappings and metadata, because the hybrid KV manager puts each of the draft's
+  three sliding-window caches in its own group (V1 assumes one);
+- loading under PP: only `mtp.*` tensors are read from the 475 GiB checkpoint (`_DSV41_ONLY_RE` in
+  `weight_utils.py`), the token embedding is read from shard 2 on the last rank (the target's is a
+  `PPMissingLayer` there), the LM head is aliased, the draft's parallel config is set to PP=1, the
+  "V1 does not support dspark" check is bypassed, async scheduling is turned off under PP (its
+  sampled-token broadcast assumes one token per request), and the eagle-family runner gates are
+  guarded for ranks without a drafter.
+- The draft attends over context through its sliding-window caches only (layers 40-42 have no
+  compress ratio), non-causally within the block; the sparse-SWA builder already handles that.
+
+`DSV41_SPEC_METHOD=dspark` selects it (K=5 fixed by `dspark_block_size`), with layers 33-39
+moved to the CPU so the draft plus its 1 GiB embedding fit on rank 3.
+
+**Why it does not replace n-gram here.** The draft is cheap (about 10 ms per step: inputs 4.9,
+context insert 0.7, forward 1.9 in a piecewise graph, sampling 2.3). The verify step is not: a
+6-row step costs about 265 ms, of which the cross-rank trace attributes ~95 ms to rank 1 and
+~155 ms to rank 3, i.e. the CPU-expert layers at ~20 ms each. Six rows route to roughly 40
+distinct experts per layer, and streaming those from host RAM sits at the DRAM ceiling; with 11
+CPU layers that is ~220 ms. Moving the draft's own experts to the CPU to win back a target layer
+nets to zero. Acceptance on free prose is modest (position 0: 68%, then 36/20/10/4%), so prose
+loses even with truncation; fresh code accepts 85% of drafts (5.1 tokens per step) and gains.
+Numbers in RESULTS.md.
+
 ## Diagnostic switches (all off by default)
 
 | switch | effect |
@@ -216,6 +255,7 @@ keeps the accepted tokens exactly those the 1+K-row verify pass would have sampl
 | `DSV41_DEBUG_TRACE=1` | cross-rank timeline of decode steps 40-44 (worker entry, receive posted, launched, sent, GPU done, engine issue) rendered by `tools/tracetl.py` |
 | `DSV41_FULL_Q1=0` | upstream behaviour under speculation: capture sizes rounded to K+1, draft-less steps in PIECEWISE graphs |
 | `DSV41_PREFILL_EAGER=0` | let prefill-shaped batches use piecewise graphs |
+| `DSV41_DEBUG_DSPARK=1` | per-phase timing of the DSpark draft step (with syncs), every 32 calls |
 | `CPU_MOE_TRACE=1` | the native CPU kernel prints its phase times |
 | `DSV41_ENGRAM_ZERO=1` | Engram lookups return zeros (isolates the SSD path) |
 | `DSV41_MHC_TORCH=1` | torch mHC instead of tilelang |

@@ -44,6 +44,7 @@ FILES=(
   v1/core/sched/scheduler.py
   config/engram.py
   config/vllm.py
+  config/speculative.py
   config/attention.py
   engine/arg_utils.py
   platforms/cuda.py

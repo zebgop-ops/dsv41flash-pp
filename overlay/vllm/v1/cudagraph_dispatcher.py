@@ -249,22 +249,24 @@ class CudagraphDispatcher:
             # dsv41 q1: a second family of FULL decode graphs with query length 1 for
             # steps in which the drafter proposed nothing (num_tokens == num_reqs)
             if uniform_decode_query_len > 1 and os.environ.get("DSV41_FULL_Q1", "1") == "1":
+                # dsv41 qall: one FULL family per uniform query length q < K+1
                 max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-                for bs, num_active_loras in product(
-                    [
-                        x
-                        for x in self.compilation_config.cudagraph_capture_sizes
-                        if x <= max_num_seqs
-                    ],
-                    lora_cases,
-                ):
-                    self.add_cudagraph_key(
-                        CUDAGraphMode.FULL,
-                        self._create_padded_batch_descriptor(
-                            bs, True, num_active_loras > 0, num_active_loras,
-                            uniform_query_len=1,
-                        ),
-                    )
+                for q in range(1, uniform_decode_query_len):
+                    for bs, num_active_loras in product(
+                        [
+                            x
+                            for x in self.compilation_config.cudagraph_capture_sizes
+                            if x % q == 0 and x // q <= max_num_seqs
+                        ],
+                        lora_cases,
+                    ):
+                        self.add_cudagraph_key(
+                            CUDAGraphMode.FULL,
+                            self._create_padded_batch_descriptor(
+                                bs, True, num_active_loras > 0, num_active_loras,
+                                uniform_query_len=q,
+                            ),
+                        )
 
         self.keys_initialized = True
 

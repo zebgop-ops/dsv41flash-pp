@@ -27,5 +27,7 @@ python3 "$HERE/patch_engram_piecewise.py" "$V/models/deepseek_v4_1/nvidia/model.
 python3 "$HERE/patch_prefill_eager.py"     "$V/v1/worker/gpu_model_runner.py"
 python3 "$HERE/patch_pad_mask.py"         "$V/v1/worker/gpu_model_runner.py"
 python3 "$HERE/patch_full_q1.py"          "$V/v1/cudagraph_dispatcher.py" "$V/v1/worker/gpu_model_runner.py"
+python3 "$HERE/patch_dspark_v1.py"        "$V/v1/worker/gpu_model_runner.py" "$V/model_executor/model_loader/weight_utils.py" "$V/config/speculative.py" "$V/config/vllm.py"
+python3 "$HERE/patch_full_qall.py"        "$V/v1/cudagraph_dispatcher.py" "$V/v1/worker/gpu_model_runner.py"
 for f in $(find "$V" -name '*.py'); do python3 -c "import ast,sys;ast.parse(open('$f').read())" || { echo "SYNTAX ERROR: $f"; exit 1; }; done
 echo "overlay applied: $(find "$V" -name '*.py' | wc -l) files"

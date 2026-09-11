@@ -23,13 +23,23 @@ PARTITION=${DSV41_PARTITION:-8,12,8,12}
 PP=$(echo "$PARTITION" | tr "," "\n" | wc -l)
 # Layers whose 384 routed experts run on the CPU (kt-kernel). Decoder layers only (they do
 # not run on prompt tokens once SWA-bounded replay lands; today they do, so prefill pays).
-CPU_LAYERS=${DSV41_CPU_EXPERT_LAYERS:-16-19,35-39}   # 8 GPU expert layers per rank fit since the Marlin repack is staged through host RAM
+# ngram (prompt lookup, no draft model; the default) | dspark (the checkpoint's own 3-layer parallel drafter,
+# ported to the V1 runner: +20% on fresh code, -15% on prose here, see FINDINGS.md §8). DSpark keeps a
+# confidence-truncated draft (DSV41_DSPARK_CONF, cumulative acceptance confidence; /dump/dspark_conf overrides
+# it at runtime, 0 = always verify all 5).
+SPEC_METHOD=${DSV41_SPEC_METHOD:-ngram}
+if [ "$SPEC_METHOD" = dspark ]; then
+  CPU_LAYERS=${DSV41_CPU_EXPERT_LAYERS:-16-19,33-39}   # two more CPU layers on rank 3: the draft (7.4 GiB + 1 GiB embedding) lives there
+  SPEC_N=${DSV41_SPEC:-5}                              # = dspark_block_size
+else
+  CPU_LAYERS=${DSV41_CPU_EXPERT_LAYERS:-16-19,35-39}   # 8 GPU expert layers per rank fit since the Marlin repack is staged through host RAM
+  SPEC_N=${DSV41_SPEC:-3}              # n-gram speculative tokens per step (0 = off; 3 measured best on code, ~10% slower on free prose)
+fi
 ENGRAM=${DSV41_ENGRAM_STORAGE:-ssd}
 GPU_ORDER=${DSV41_GPUS:-all}
 UTIL=${DSV41_UTIL:-0.97}
 MAXLEN=${DSV41_MAXLEN:-131072}
 SEQS=${DSV41_SEQS:-4}
-SPEC_N=${DSV41_SPEC:-3}              # n-gram speculative tokens per step (0 = off; 3 measured best on code, ~10% slower on free prose); method via DSV41_SPEC_METHOD
 # Graph mode: without speculation FULL_DECODE_ONLY (exact, no piecewise graphs needed). With speculation
 # FULL_AND_PIECEWISE: 1-token steps replay q=1 FULL graphs (patch_full_q1), verify steps q=K+1 FULL graphs,
 # mixed batches piecewise (Engram/shadow sources need patch_engram_piecewise there); prefill runs eager.
@@ -90,12 +100,13 @@ PY
 )
 if [ -n "$CPU_RE" ]; then SKIP_RE="${SKIP_RE:+$SKIP_RE|}layers\.($CPU_RE)\.ffn\.experts\."; fi
 SPEC_ARGS=()
-SPEC_METHOD=${DSV41_SPEC_METHOD:-ngram}     # ngram (prompt lookup, lossless, no draft model) | dspark
+# SPEC_METHOD is set with CPU_LAYERS above (dspark needs two more CPU layers on the last rank)
 if [ "$SPEC_N" != "0" ]; then
   # capture sizes 1..4 (q=1 graphs, one per request count) plus multiples of K+1 (verify steps); vLLM's own
   # rounding to multiples of K+1 is disabled by patch_full_q1 (DSV41_FULL_Q1=1)
   if [ -z "${DSV41_CG_SIZES:-}" ]; then
-    DSV41_CG_SIZES=$(python3 -c "k=$SPEC_N+1; print(sorted(set(range(1,$SEQS+1))|{m*k for m in range(1,$SEQS+1)}))" | tr -d ' ')
+    # q=1..K families for 1-2 requests, K+1 family for all request counts (patch_full_qall)
+    DSV41_CG_SIZES=$(python3 -c "k=$SPEC_N+1; print(sorted(set(range(1,$SEQS+1))|{q*r for q in range(2,k) for r in (1,2)}|{m*k for m in range(1,$SEQS+1)}))" | tr -d ' ')
   fi
   SPEC_ARGS+=("-cc.cudagraph_capture_sizes=$DSV41_CG_SIZES")
   if [ "$SPEC_METHOD" = ngram ]; then
@@ -115,7 +126,7 @@ docker run -d --name "$NAME" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$GPU_OR
   -e PYTHONPATH=/opt/dsv41:/opt/dsv41/kt-site \
   -e VLLM_PP_LAYER_PARTITION="$PARTITION" \
   -e DSV41_CPU_EXPERT_LAYERS="$CPU_LAYERS" -e DSV41_ENGRAM_STORAGE="$ENGRAM" \
-  -e DSV41_ENGRAM_ZERO="${DSV41_ENGRAM_ZERO:-0}" -e DSV41_DEBUG_STATS="${DSV41_DEBUG_STATS:-0}" -e DSV41_MHC_TORCH="${DSV41_MHC_TORCH:-0}" -e DSV41_DEBUG_DUMP="${DSV41_DEBUG_DUMP:-}" -e DSV41_CPU_MOE="${DSV41_CPU_MOE:-native}" -e DSV41_DEBUG_TIMING="${DSV41_DEBUG_TIMING:-0}" -e DSV41_DEBUG_PROFILE="${DSV41_DEBUG_PROFILE:-0}" -e DSV41_DEBUG_GDUMP="${DSV41_DEBUG_GDUMP:-}" -e DSV41_DEBUG_SPEC="${DSV41_DEBUG_SPEC:-0}" -e DSV41_DEBUG_ENGRAM="${DSV41_DEBUG_ENGRAM:-0}" -e DSV41_PREFILL_EAGER="${DSV41_PREFILL_EAGER:-1}" -e DSV41_FULL_Q1="${DSV41_FULL_Q1:-1}" -e DSV41_DEBUG_CORE="${DSV41_DEBUG_CORE:-0}" -e DSV41_DEBUG_TRACE="${DSV41_DEBUG_TRACE:-0}" -e DSV41_DEBUG_SYNC="${DSV41_DEBUG_SYNC:-0}" -e DSV41_CPU_EXPERT_THREADS="${DSV41_CPU_EXPERT_THREADS:-16}" -v /home/r/dsv41-run/dump:/dump -e DSV41_MODEL_DIR="$MODEL" -e DSV41_MEM_CAP_FRACTION="$MEM_CAP" -e DSV41_SKIP_WEIGHT_RE="$SKIP_RE" \
+  -e DSV41_ENGRAM_ZERO="${DSV41_ENGRAM_ZERO:-0}" -e DSV41_DEBUG_STATS="${DSV41_DEBUG_STATS:-0}" -e DSV41_MHC_TORCH="${DSV41_MHC_TORCH:-0}" -e DSV41_DEBUG_DUMP="${DSV41_DEBUG_DUMP:-}" -e DSV41_CPU_MOE="${DSV41_CPU_MOE:-native}" -e DSV41_DEBUG_TIMING="${DSV41_DEBUG_TIMING:-0}" -e DSV41_DEBUG_PROFILE="${DSV41_DEBUG_PROFILE:-0}" -e DSV41_DEBUG_GDUMP="${DSV41_DEBUG_GDUMP:-}" -e DSV41_DEBUG_SPEC="${DSV41_DEBUG_SPEC:-0}" -e DSV41_DEBUG_ENGRAM="${DSV41_DEBUG_ENGRAM:-0}" -e DSV41_PREFILL_EAGER="${DSV41_PREFILL_EAGER:-1}" -e DSV41_FULL_Q1="${DSV41_FULL_Q1:-1}" -e DSV41_DEBUG_CORE="${DSV41_DEBUG_CORE:-0}" -e DSV41_DEBUG_TRACE="${DSV41_DEBUG_TRACE:-0}" -e DSV41_DEBUG_DSPARK="${DSV41_DEBUG_DSPARK:-0}" -e DSV41_DSPARK_CONF="${DSV41_DSPARK_CONF:-0.7}" -e DSV41_DEBUG_SYNC="${DSV41_DEBUG_SYNC:-0}" -e DSV41_CPU_EXPERT_THREADS="${DSV41_CPU_EXPERT_THREADS:-16}" -v /home/r/dsv41-run/dump:/dump -e DSV41_MODEL_DIR="$MODEL" -e DSV41_MEM_CAP_FRACTION="$MEM_CAP" -e DSV41_SKIP_WEIGHT_RE="$SKIP_RE" \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e VLLM_USE_V2_MODEL_RUNNER=0 -e PYTHONFAULTHANDLER=1 \
   ${DSV41_EXTRA_DOCKER:-} \
   "$IMG" \

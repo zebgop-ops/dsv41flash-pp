@@ -84,6 +84,22 @@ costs ~2.5x a 1-token step because the CPU-expert layers stream every expert any
 Speculation therefore wins where drafts are accepted most of the time (code, edits, quoting) and
 loses ~10% on free prose.
 
+### DSpark (the checkpoint's own drafter, `DSV41_SPEC_METHOD=dspark`)
+
+Streaming, thinking off, 300 generated tokens, wall time including prefill. DSpark runs with
+layers 33-39 on the CPU (two more than the other rows) and confidence truncation at 0.7.
+
+| workload | no speculation | n-gram K=3 | DSpark |
+|---|---|---|---|
+| free prose | ~18 s | ~20 s | 22.2 s (1.44 tokens/step, 106 ms/step) |
+| code edit, 529-token prompt (copy-heavy) | ~31 s | ~23 s | 20.6 s (5.56 tokens/step) |
+| fresh code (LRU cache + tests, nothing to copy) | ~19 s | ~19 s | 15.3 s (5.1 tokens/step, 85% of drafts accepted) |
+| logprobs vs eager | 0.000 | 0.000 | text same; 0.5-0.9 nats at later positions (multi-row verify numerics) |
+| greedy code-edit output vs no-spec | – | identical | identical |
+
+Without truncation (`DSV41_DSPARK_CONF=0`) every step verifies 6 rows at ~265 ms: prose falls to
+8.3 tok/s. The cost is the CPU-expert layers (~20 ms each per 6-row step, FINDINGS.md §8).
+
 ## Memory
 
 | rank | layers | GPU weights + non-torch | KV pool |
