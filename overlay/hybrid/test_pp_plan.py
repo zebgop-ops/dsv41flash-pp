@@ -17,7 +17,7 @@ dist = mk("vllm.distributed", get_pp_group=lambda: _PP(CUR[0], 4))
 import torch  # noqa
 CUR = [0]
 import os; os.environ["VLLM_PP_LAYER_PARTITION"] = sys.argv[1] if len(sys.argv) > 1 else "8,6,10,16"
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+sys.path.insert(0, "/home/r/dsv41-run/overlay")
 from hybrid import pp_shadow
 cfg = json.load(open(sys.argv[2] if len(sys.argv) > 2 else "/tmp/claude-1000/-home-r-claude/797f92eb-7c73-445f-bced-0f32d24e05f0/scratchpad/config.json"))["text_config"]
 cfg = types.SimpleNamespace(**cfg)

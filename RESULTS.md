@@ -59,6 +59,31 @@ MXFP4 path, used before, cost 5.7 ms per layer-step at any thread count. Prefill
 experts on every prompt token of the 9 layers (1.8 s per 2048-token chunk), which is what
 holds it near 100 tok/s.
 
+## Speculative decoding (n-gram prompt lookup)
+
+`DSV41_SPEC=K` turns on vLLM's n-gram drafter (`prompt_lookup_min` 5, `max` 8 by default; no draft
+model, rejection sampling). Same launcher, same checkpoint; all numbers single-stream, greedy,
+400 generated tokens, wall time including prefill (`tools/specbench.py`, thinking on) or streaming
+with thinking off (`tools/itl.py`).
+
+| workload | no speculation | K=3 | K=2 |
+|---|---|---|---|
+| code edit, 525-token prompt (thinking on): drafts accepted | – | 97% (2.91 tokens/step) | 97% (1.94 tokens/step) |
+| code edit: wall incl. prefill | 31.6-32.2 s (12.4-12.7 tok/s) | 26.2 s (15.3 tok/s) | 27.9 s (14.3 tok/s) |
+| code edit (thinking off), 529-token prompt, streaming | – | 23.3 s (129 steps for 400 tokens) | 27.9 s (14.3 tok/s)ITL |
+| free prose (thinking on): drafts accepted | – | 80% of 15 drafted (5 draft steps in 400 tokens) | 92% of 12 drafted (6 draft steps) |
+| free prose: wall incl. prefill | 23.8-24.5 s (16.3-16.8 tok/s) | 28.3 s (14.1 tok/s) | 27.9 s (14.3 tok/s) |
+| free prose (thinking off), streaming, two runs | 21.8 / 25.2 s | 26.1 / 27.9 s | 27.9 s (14.3 tok/s)ITL |
+| draft-less decode step (streaming windows) | 58-60 ms | 61-70 ms | 70-72 ms |
+| top-5 logprobs vs eager, 3 probes × 3 positions | 0.000 | 0.000 | 0.000 |
+| greedy code-edit output vs no-spec | – | identical | identical |
+
+Where the time goes: a 1-token step costs ~65 ms with speculation on versus ~58 ms off, because
+vLLM disables async scheduling for CPU n-gram drafting (FINDINGS.md §7); a 1+K-token verify step
+costs ~2.5x a 1-token step because the CPU-expert layers stream every expert any row routes to.
+Speculation therefore wins where drafts are accepted most of the time (code, edits, quoting) and
+loses ~10% on free prose.
+
 ## Memory
 
 | rank | layers | GPU weights + non-torch | KV pool |
@@ -76,7 +101,11 @@ tables are never loaded: rows are `pread` from shards 47/48 through the page cac
 
 ## Not done / known limits
 
-- DSpark speculative decoding stays off: this image has no `broadcast_drafts` for PP.
+- Speculation is n-gram prompt lookup (on by default, `DSV41_SPEC=0` to turn off). DSpark, the
+  model's own drafter, stays off: this image has no `broadcast_drafts` for PP, the draft stack would
+  need ~6.5 GiB on rank 3, and its verify steps would pay the same CPU-expert cost per row.
+- Async scheduling is off whenever speculation is on (vLLM disables it for CPU n-gram), which is
+  the ~7 ms/step cost on draft-less steps (FINDINGS.md §7).
 - Context validated to 29k tokens; the launcher allows 131k and the model 1M. Prefill time
   (~65 tok/s) is the practical limit, not memory.
 - The chat template has no thinking toggle; reasoning always comes back in

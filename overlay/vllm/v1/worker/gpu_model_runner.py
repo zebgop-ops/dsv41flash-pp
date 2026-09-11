@@ -15,6 +15,7 @@ from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
+import os
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -631,6 +632,9 @@ class GPUModelRunner(
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
+        # dsv41: non-last PP ranks never build a drafter but the metadata builder
+        # isinstance-checks it; None makes those checks false instead of raising.
+        self.drafter = None  # type: ignore[assignment]
         if self.speculative_config and get_pp_group().is_last_rank:
             self.drafter: (
                 NgramProposer  # noqa: F823
@@ -1107,6 +1111,60 @@ class GPUModelRunner(
             buf.np[:num_reqs] = np.where(valid, ids, -1)
         return buf.copy_to_gpu()
 
+    def _dsv41_engram_static_meta(self):
+        """Static (query_start_loc, slot_mapping, block_table) buffers of the Engram SWA
+        group so the model can hash n-grams inside PIECEWISE graph capture."""
+        prefix = self.__dict__.get("_dsv41_engram_prefix", "?")
+        if prefix == "?":
+            prefix = None
+            for m in getattr(self, "model", torch.nn.Module()).modules():
+                p = getattr(m, "engram_swa_prefix", None)
+                if p is not None:
+                    prefix = p
+                    break
+            self.__dict__["_dsv41_engram_prefix"] = prefix
+        cfg = getattr(self, "kv_cache_config", None)
+        if prefix is None or cfg is None:
+            return None
+        gid = self.__dict__.get("_dsv41_engram_gid")
+        if gid is None:
+            # index into input_batch.block_table, which skips encoder-only groups
+            bt_idx = 0
+            for g in cfg.kv_cache_groups:
+                if get_kv_cache_spec_kind(g.kv_cache_spec) == KVCacheSpecKind.ENCODER_ONLY_ATTENTION:
+                    continue
+                if prefix in g.layer_names:
+                    gid = bt_idx
+                    break
+                bt_idx += 1
+            if gid is None:
+                return None
+            self.__dict__["_dsv41_engram_gid"] = gid
+            _bt0 = self.input_batch.block_table[gid]
+            logger.info("DSV41 engram static meta: group %d (block_size %d, table %s) for %s",
+                        gid, _bt0.block_size, tuple(_bt0.block_table.gpu.shape), prefix)
+        bt = self.input_batch.block_table[gid]
+        return (self.query_start_loc.gpu, bt.slot_mapping.gpu, bt.block_table.gpu)
+
+    def _dsv41_pad_view(self, num_padded: int) -> torch.Tensor:
+        """Static bool buffer [max tokens]: True for CUDA-graph padding rows."""
+        buf = self.__dict__.get("_dsv41_pad_buf")
+        if buf is None or buf.numel() < num_padded:
+            n = max(int(num_padded), int(getattr(self, "max_num_tokens", num_padded)) * 2)
+            buf = torch.zeros(n, dtype=torch.bool, device=self.device)
+            self.__dict__["_dsv41_pad_buf"] = buf
+            self.__dict__["_dsv41_pad_cpu"] = torch.zeros(n, dtype=torch.bool, device="cpu", pin_memory=True)
+        return buf[:num_padded]
+
+    def _dsv41_pad_set(self, num_actual: int, num_padded: int) -> torch.Tensor:
+        view = self._dsv41_pad_view(num_padded)
+        cpu = self.__dict__["_dsv41_pad_cpu"]
+        cpu[:num_padded] = False
+        if num_padded > num_actual:
+            cpu[num_actual:num_padded] = True
+        view.copy_(cpu[:num_padded], non_blocking=True)
+        return view
+
     def _init_model_kwargs(self, num_reqs: int | None = None):
         model_kwargs = dict[str, Any]()
 
@@ -1116,6 +1174,10 @@ class GPUModelRunner(
             model_kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
                 num_reqs
             )
+            # dsv41: engram static meta (see overlay/patch_engram_piecewise.py)
+            meta = self._dsv41_engram_static_meta()
+            if meta is not None:
+                model_kwargs["engram_static_meta"] = meta
 
         if not self.is_pooling_model:
             return model_kwargs
@@ -1457,18 +1519,20 @@ class GPUModelRunner(
                     # sampled token ids back because there's no direct communication
                     # between the first-stage worker and the last-stage worker.
                     new_token_ids = req_data.new_token_ids[i]
-                    # Add the sampled token(s) from the previous step (if any).
-                    # This doesn't include "unverified" tokens like spec tokens.
-                    num_new_tokens = (
-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
-                    )
-                    if num_new_tokens == 1:
-                        # Avoid slicing list in most common case.
-                        req_state.output_token_ids.append(new_token_ids[-1])
-                    elif num_new_tokens > 0:
-                        req_state.output_token_ids.extend(
-                            new_token_ids[-num_new_tokens:]
-                        )
+                    # dsv41: append exactly what the scheduler sent (it sends every
+                    # output token the worker has not seen, drafts accepted last
+                    # step included; see patch_pp_spec_tokens.py).
+                    if new_token_ids:
+                        # Re-sent tokens (re-prefill after preemption) are dropped:
+                        # the scheduler's slice ends at the current non-draft token.
+                        _end = num_computed_tokens + scheduler_output.num_scheduled_tokens[
+                            req_id
+                        ] - len(scheduled_spec_tokens.get(req_id, ()))
+                        _drop = max(0, req_state.num_tokens - (_end - len(new_token_ids)))
+                        if _drop:
+                            new_token_ids = new_token_ids[_drop:]
+                        if new_token_ids:
+                            req_state.output_token_ids.extend(new_token_ids)
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure, or output_token_ids was inflated by the optimistic
@@ -1524,18 +1588,21 @@ class GPUModelRunner(
                 # than num_tokens_no_spec.
                 # Async scheduled PP: no new_token_ids, advance num_tokens_no_spec
                 # according to num_computed_tokens.
-                end_token_index = max(
-                    start_token_index,
-                    num_computed_tokens + len(new_token_ids),
-                )
+                if new_token_ids:
+                    # dsv41: the received tokens are exactly the ones missing
+                    # from [start_token_index, ...).
+                    end_token_index = start_token_index + len(new_token_ids)
+                else:
+                    end_token_index = max(
+                        start_token_index,
+                        num_computed_tokens + len(new_token_ids),
+                    )
                 if end_token_index > start_token_index:
                     if new_token_ids:
                         # Add new_token_ids to token_ids_cpu.
-                        num_new_tokens = end_token_index - start_token_index
-                        tokens_to_append = new_token_ids[-num_new_tokens:]
                         self.input_batch.token_ids_cpu[
                             req_index, start_token_index:end_token_index
-                        ] = tokens_to_append
+                        ] = new_token_ids
                     self.input_batch.is_token_ids[
                         req_index, start_token_index:end_token_index
                     ] = True
@@ -4012,13 +4079,19 @@ class GPUModelRunner(
         Checks if it's a decode batch with same amount scheduled tokens
         across all requests.
         """
+        if force_uniform_decode is not None:
+            return force_uniform_decode
+        if (
+            (max_num_scheduled_tokens == uniform_decode_query_len)
+            and (num_tokens == max_num_scheduled_tokens * num_reqs)
+        ):
+            return True
+        # dsv41 q1: draft-less steps under spec decode are uniform with query length 1
         return (
-            (
-                (max_num_scheduled_tokens == uniform_decode_query_len)
-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
-            )
-            if force_uniform_decode is None
-            else force_uniform_decode
+            uniform_decode_query_len > 1
+            and max_num_scheduled_tokens == 1
+            and num_tokens == num_reqs
+            and os.environ.get("DSV41_FULL_Q1", "1") == "1"
         )
 
     def _allow_microbatching(
@@ -4118,12 +4191,28 @@ class GPUModelRunner(
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
+                uniform_query_len=max_num_scheduled_tokens if uniform_decode else None,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
             num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
         )
+        # dsv41: prefill-shaped batches run eagerly instead of in piecewise graphs
+        if (
+            cudagraph_mode == CUDAGraphMode.PIECEWISE
+            and force_uniform_decode is None  # real steps only (capture/dummy runs force it)
+            and not force_eager
+            and os.environ.get("DSV41_PREFILL_EAGER", "1") == "1"
+            and max_num_scheduled_tokens > self.uniform_decode_query_len
+        ):
+            cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                num_tokens_padded, valid_modes={CUDAGraphMode.NONE}
+            )
+        if os.environ.get("DSV41_DEBUG_SPEC") == "1" and force_uniform_decode is None and num_tokens <= 8:
+            logger.info("DSV41 DISPATCH tokens=%d reqs=%d maxq=%d uniform=%s -> %s %s",
+                        num_tokens, num_reqs, max_num_scheduled_tokens, uniform_decode,
+                        cudagraph_mode, batch_descriptor)
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
             assert (
@@ -4569,6 +4658,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                is_padding=self._dsv41_pad_set(num_tokens_unpadded, num_tokens_padded),
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -5969,6 +6059,7 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         randomize_inputs: bool = False,
+        uniform_query_len: int | None = None,  # dsv41 q1
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -6021,7 +6112,11 @@ class GPUModelRunner(
         # When setting max_query_len = 1, we switch to and capture the optimized
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
-        max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
+        max_query_len = (
+            (uniform_query_len or self.uniform_decode_query_len)
+            if uniform_decode
+            else num_tokens
+        )
 
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
@@ -6278,6 +6373,7 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    is_padding=self._dsv41_pad_view(num_tokens_padded),
                 ),
             ):
                 outputs = self.model(
@@ -7064,6 +7160,11 @@ class GPUModelRunner(
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
                 force_attention=force_attention,
                 uniform_decode=desc.uniform,
+                uniform_query_len=(
+                    desc.num_tokens // desc.num_reqs
+                    if (desc.uniform and desc.num_reqs)
+                    else None
+                ),
                 allow_microbatching=allow_microbatching,
                 skip_eplb=True,
                 remove_lora=False,
@@ -7084,6 +7185,11 @@ class GPUModelRunner(
                 desc.num_tokens,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 uniform_decode=desc.uniform,
+                uniform_query_len=(
+                    desc.num_tokens // desc.num_reqs
+                    if (desc.uniform and desc.num_reqs)
+                    else None
+                ),
                 allow_microbatching=allow_microbatching,
                 skip_eplb=True,
                 remove_lora=False,
@@ -7312,6 +7418,14 @@ class GPUModelRunner(
                 if cg_support.value < min_cg_support.value:
                     min_cg_support = cg_support
                     min_cg_attn_backend = attn_backend.__name__
+        if (
+            self.uniform_decode_query_len > 1
+            and os.environ.get("DSV41_FULL_Q1", "1") == "1"
+        ):
+            # dsv41 q1: keep capture sizes 1..K (the dispatcher filters the K+1 family)
+            self.compilation_config.adjust_cudagraph_sizes_for_spec_decode = (
+                lambda *a, **k: None
+            )
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             min_cg_support,
             min_cg_attn_backend,

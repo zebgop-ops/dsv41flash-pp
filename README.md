@@ -54,9 +54,11 @@ delete any `deep_gemm` it drags in). The launcher mounts it read-only into the i
 bind-mount. Knobs: `DSV41_PARTITION` (default `8,12,8,12`), `DSV41_CPU_EXPERT_LAYERS`
 (`16-19,35-39`), `DSV41_CPU_MOE` (`native` | `kt`), `DSV41_CPU_EXPERT_THREADS` (16, one per
 physical core), `DSV41_ENGRAM_STORAGE` (`ssd`), `DSV41_MAXLEN` (131072), `DSV41_SEQS`,
-`DSV41_UTIL` (0.97), `DSV41_CG` (`FULL_AND_PIECEWISE`; `NONE` for diagnostics), `DSV41_GPUS`,
-`DSV41_EXTRA_ARGS`, `DSV41_EXTRA_DOCKER` (e.g. `"-e CUDA_LAUNCH_BLOCKING=1"`), and the
-diagnostic switches in [FINDINGS.md](FINDINGS.md). It pre-flights the checkpoint, the
+`DSV41_UTIL` (0.97), `DSV41_SPEC` (n-gram speculative tokens per step, default `3`; `0` = off;
+`DSV41_NGRAM_MIN` 5 / `DSV41_NGRAM_MAX` 8), `DSV41_CG` (`FULL_DECODE_ONLY` without speculation,
+`FULL_AND_PIECEWISE` with it; `NONE` for diagnostics), `DSV41_GPUS`, `DSV41_EXTRA_ARGS`,
+`DSV41_EXTRA_DOCKER` (e.g. `"-e CUDA_LAUNCH_BLOCKING=1"`), and the diagnostic switches in
+[FINDINGS.md](FINDINGS.md). It pre-flights the checkpoint, the
 driver (kernel module vs userland mismatch after an upgrade), other servers on the cards,
 and CUDA init on every GPU before touching anything.
 
@@ -113,6 +115,17 @@ that produced it.
    projected group under PP; `has_deep_gemm()` vs `is_deep_gemm_supported()` gating in the
    MLA indexer metadata builder; tilelang prenorm and `execute_in_parallel` capture guards;
    a Triton autotune guard for keys that surface only under full-graph capture.
+8. **Speculative decoding under PP with CPU experts** (FINDINGS.md §7). vLLM's n-gram
+   drafter (no draft model, rejection sampling) needed six fixes to run on this stack:
+   non-last ranks had no `drafter` attribute; the scheduler shipped only the one scheduled
+   token to ranks 0-2 (accepted drafts never arrived); the PP batch queue scheduled a request
+   again while its drafts were in flight; PIECEWISE graphs were captured with
+   `attn_metadata=None`, baking Engram hashing and the shadow-source inserts in as no-ops;
+   graph padding rows ran full CPU-expert passes; and vLLM rounds every capture size to a
+   multiple of K+1 and knows one uniform-decode query length, so draft-less steps ran in
+   piecewise graphs (`patch_full_q1.py` adds q=1 FULL graphs). Logprobs equal eager; the
+   code-edit output is identical with and without speculation. The remaining cost of a
+   draft-less step (~65 vs ~58 ms) is vLLM disabling async scheduling for CPU n-gram.
 
 ## Layout
 
@@ -120,6 +133,8 @@ that produced it.
 serve/run-dsv41-pp4.sh   production launcher (preflight, mounts, all flags)
 overlay/vllm/            the Python overlay, mounted over the image's vllm package
 overlay/patch_*.py       anchor-based, idempotent patch scripts; apply-overlay.sh runs them all
+                         (spec decode under PP: patch_v1_spec_pp, patch_pp_spec_tokens, patch_engram_piecewise,
+                         patch_prefill_eager, patch_pad_mask, patch_full_q1 — FINDINGS.md §7)
 overlay/make-overlay.sh  extracts pristine files from the image (for diffing / re-seeding)
 overlay/engram_ssd/      row_store.cpp + build.sh, engram_ssd.py, CPU/GPU tests
 overlay/hybrid/          cpu_experts.py, cpu_moe.cpp/.py (native CPU MoE), marlin_staged.py,
@@ -128,7 +143,10 @@ overlay/sm80-src/        the V4 Ampere files (haosdent/vllm@f8ea5bb) the port wa
 patches/vllm-overlay.diff  full delta vs the pristine image
 ktests/                  kernel tests and the torch oracles (ref_layer0*.py, ref_stages.py)
 kt/                      kt-kernel MXFP4 correctness/perf tests (wheel and site dir not included)
-tools/                   smoke.py, plen.py, needle.py, bench.py, soak.py (+ detect.py)
+tools/                   smoke.py, plen.py, needle.py, bench.py, soak.py (+ detect.py);
+                         specbench.py (spec-decode acceptance + output diff), lpcheck.py (top-5 logprobs vs
+                         a saved eager run), itl.py (streaming per-window rate), batchinv.py (batch
+                         invariance of the eager path), tracetl.py / profcpu.sh (timeline + profiler readers)
 PLAN.md                  design notes and the boot-by-boot log
 ```
 

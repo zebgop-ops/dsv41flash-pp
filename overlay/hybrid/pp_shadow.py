@@ -120,7 +120,24 @@ class ShadowSource(nn.Module):
     def run(self, x: torch.Tensor, positions: torch.Tensor, need_topk: bool) -> None:
         """Recompute what consumers read from this source: the compressed-KV
         cache and indexer K cache (always), plus the top-k indices / candidate
-        blocks when a local layer uses this source's indexer."""
+        blocks when a local layer uses this source's indexer.
+
+        Runs as a breakable-cudagraph *eager* segment: the compressor insert and
+        indexer K store are gated on attention metadata, which is absent during
+        PIECEWISE capture, so a captured copy would be a permanent no-op."""
+        fns = self.__dict__.setdefault("_dsv41_eager_fns", {})
+        fn = fns.get(bool(need_topk))
+        if fn is None:
+            # tensors only cross the eager-break boundary; bind self/need_topk here
+            impl = self._run_impl
+            if need_topk:
+                fn = _eager_break(lambda x_, p_: impl(x_, p_, True))
+            else:
+                fn = _eager_break(lambda x_, p_: impl(x_, p_, False))
+            fns[bool(need_topk)] = fn
+        fn(x, positions)
+
+    def _run_impl(self, x: torch.Tensor, positions: torch.Tensor, need_topk: bool) -> None:
         attn = self.attn
         qr_kv, kv_score, indexer_weights = attn._run_parallel_input_projections(x)
         qr, qr_scale, _kv = attn._split_qkv_and_norm(qr_kv)
@@ -136,6 +153,13 @@ class ShadowSource(nn.Module):
         if need_topk and attn.indexer is not None and index_q is not None:
             q_quant = (index_q, index_q_scale) if index_q_scale is not None else index_q
             attn.indexer.indexer_op(x, q_quant, None, index_weights_out)
+
+
+try:
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture as _eager_break
+except Exception:  # pragma: no cover - older images
+    def _eager_break(fn):
+        return fn
 
 
 def remap_shadow_weight_name(name: str, shadow_ids: list[int]) -> str:

@@ -15,6 +15,7 @@ FILES=(
   models/deepseek_v4_1/amd/rocm.py
   models/deepseek_v4_1/amd/model.py
   models/deepseek_v4_1/nvidia/model.py
+  models/deepseek_v4_1/nvidia/vl_model.py
   models/deepseek_v4_1/nvidia/dspark.py
   models/deepseek_v4_1/nvidia/model_state.py
   models/deepseek_v4_1/attention.py
@@ -38,6 +39,9 @@ FILES=(
   v1/worker/gpu/pp_utils.py
   v1/worker/gpu_worker.py
   v1/worker/gpu_model_runner.py
+  v1/cudagraph_dispatcher.py
+  v1/engine/core.py
+  v1/core/sched/scheduler.py
   config/engram.py
   config/vllm.py
   config/attention.py

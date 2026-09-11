@@ -132,6 +132,72 @@ rank 3 shadows kv source 20.
 - **Pinned buffers under the CUDA default device**: `torch.empty(..., pin_memory=True)`
   without an explicit `device="cpu"` inside a worker lands on the GPU.
 
+## 7. Speculative decoding under PP4 with CPU experts (n-gram, same outputs on code)
+
+**What it buys.** Prompt-lookup (n-gram) drafts cost nothing to produce and are verified in one
+forward pass. On this box a verify step with 1+K tokens is *not* cheap, though: the CPU-expert
+layers stream the weights of every expert any row routes to, so a 4-row step moves up to 4x the
+expert bytes (measured ~2.5x the wall time of a 1-row step). Speculation therefore pays only where
+drafts are accepted most of the time — code edits, rewrites, quoting context — and costs a little
+elsewhere. Numbers in RESULTS.md.
+
+**What was broken, in the order it was found.** Every item below reproduced as garbage, a crash, or
+a silent divergence from the eager reference (`tools/lpcheck.py` compares top-5 logprobs at three
+positions against a saved eager run; `tools/specbench.py` compares greedy outputs against the
+no-spec run and reads acceptance from `/metrics`).
+
+1. *Non-last ranks have no drafter.* The V1 runner reads `self.drafter` on every rank; with PP the
+   attribute only exists on the last one. `patch_v1_spec_pp.py` defines it as `None` first.
+2. *Token bookkeeping across ranks.* Under PP the scheduler ships sampled tokens back to the
+   workers (there is no direct last→first rank path). It shipped only the one token scheduled this
+   step, so accepted draft tokens never reached ranks 0-2; the per-request token arrays drifted, and
+   the next step indexed past the end. `patch_pp_spec_tokens.py` sends every token a worker has not
+   seen yet, and the worker appends exactly those.
+3. *Scheduling ahead of the output.* With the PP batch queue the scheduler could schedule a request
+   again while its previous step was still in flight; with drafts pending that produced a batch made
+   of drafts only, negative logits indices and a device assert. The same patch skips a request whose
+   tokens are all in flight (non-async scheduling only).
+4. *PIECEWISE graphs were captured without attention metadata.* The model gates Engram hashing and
+   the PP shadow-source inserts on `attn_metadata`; during piecewise capture it is `None`, so both
+   were baked into the graph as no-ops and decode logits depended on boot history.
+   `patch_engram_piecewise.py` hands the model static (query_start_loc, slot_mapping, block_table)
+   buffers of the Engram group, and `pp_shadow.py` runs its update as a breakable-cudagraph eager
+   segment.
+5. *Padded rows reached the CPU experts.* Graph padding (1 real row in a 4-row graph) ran full
+   expert passes for the padding and changed the accumulation grouping of the real row.
+   `patch_pad_mask.py` publishes `ForwardContext.is_padding` every step; `cpu_experts.py` masks the
+   padded rows' routing (prose decode 7.0 → 12.7 tok/s at that point). Prefill-shaped batches are
+   kept out of piecewise graphs (`patch_prefill_eager.py`).
+6. *Capture sizes are rounded to multiples of K+1.* vLLM rounds every CUDA-graph capture size up to
+   a multiple of `1 + num_speculative_tokens` whenever decode uses FULL graphs, so with K=3 the
+   sizes 1, 2, 3 disappear and a draft-less step (one real token) replays a 4-row graph. The
+   dispatcher also knows only one "uniform decode" query length (K+1), so 1-token steps fell to
+   PIECEWISE graphs, whose eager attention/indexer/Engram segments cost ~35 ms of host time per
+   step here. `patch_full_q1.py` adds a second family of FULL decode graphs with query length 1
+   (`num_tokens == num_reqs`), dispatches draft-less steps to it, and skips the rounding
+   (`DSV41_FULL_Q1=0` restores upstream behaviour). Logprobs on 1-token steps are then identical
+   to eager (0.000 on every probe).
+
+**What is left, and why it is structural.** A draft-less step still costs ~65 ms against ~58 ms
+without speculation (streaming, thinking off). vLLM turns on *async scheduling* by default and
+turns it off for CPU n-gram speculation. Without it the engine is synchronous: schedule → RPC →
+rank-0 host prep (~4.5 ms) → the four-rank GPU chain → sample → a blocking `take_draft_token_ids`
+RPC → next step; with it, the sampled token reaches ranks 0-2 by GPU broadcast and rank 0's prep
+and launch for the next step overlap the current one. The GPU n-gram drafter keeps async
+scheduling, but PP + async asserts `[num_reqs, 1]` sampled ids and its invalid-draft trimming
+runs on every rank from a buffer only the last rank fills — it crashes on rank 0 as shipped.
+Plumbing that through PP would recover at most the ~3 ms engine round trip, because rank 0's
+prep must wait for the drafts anyway, so it was not pursued. The cross-rank timeline that
+established this is `DSV41_DEBUG_TRACE=1` + `tools/tracetl.py` (steps 40-44: worker entry,
+receive posted, launched, sent, GPU done, plus the engine's RPC issue time).
+
+**Numerics.** Greedy output of the code-edit task is byte-identical with and without speculation.
+Free prose diverges after a few hundred characters: a 4-row verify step evaluates the row with
+different kernel tilings than a 1-row step, and this stack's eager path itself is not
+batch-invariant (`tools/batchinv.py`: concurrent vs sequential prefill differs by up to 2.2 nats
+on tail tokens with the same top-1). The deviations sit inside that envelope; rejection sampling
+keeps the accepted tokens exactly those the 1+K-row verify pass would have sampled.
+
 ## Diagnostic switches (all off by default)
 
 | switch | effect |
@@ -143,6 +209,13 @@ rank 3 shadows kv source 20.
 | `DSV41_DEBUG_SYNC=1` | device syncs around the PP receive and per KV group in slot mapping; logs block-table geometry and per-step recv-wait/forward times |
 | `DSV41_DEBUG_TIMING=1` | per-layer wall time (with syncs) every 16th decode step |
 | `DSV41_DEBUG_PROFILE=1` | wraps the 41st decode step in `torch.profiler` and logs the top kernels by device time per rank |
+| `DSV41_DEBUG_SPEC=1` | logs every small batch's CUDA-graph dispatch (tokens, requests, uniform, mode, descriptor) |
+| `DSV41_DEBUG_ENGRAM=1` | checks the static Engram metadata buffers against the live attention metadata every step |
+| `DSV41_DEBUG_GDUMP=/dump` | graph-safe per-layer / sub-block activation dumps (`cudaLaunchHostFunc` + pinned buffers), compared with `ktests/diff_gdump.py` |
+| `DSV41_DEBUG_CORE=1` | engine-core phase means (schedule, RPC issue, wait, take_draft, update) every 32 real steps |
+| `DSV41_DEBUG_TRACE=1` | cross-rank timeline of decode steps 40-44 (worker entry, receive posted, launched, sent, GPU done, engine issue) rendered by `tools/tracetl.py` |
+| `DSV41_FULL_Q1=0` | upstream behaviour under speculation: capture sizes rounded to K+1, draft-less steps in PIECEWISE graphs |
+| `DSV41_PREFILL_EAGER=0` | let prefill-shaped batches use piecewise graphs |
 | `CPU_MOE_TRACE=1` | the native CPU kernel prints its phase times |
 | `DSV41_ENGRAM_ZERO=1` | Engram lookups return zeros (isolates the SSD path) |
 | `DSV41_MHC_TORCH=1` | torch mHC instead of tilelang |

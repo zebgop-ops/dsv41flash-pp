@@ -1146,6 +1146,10 @@ class Worker(WorkerBase):
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        _dsv41_trace = os.environ.get("DSV41_DEBUG_TRACE") == "1" and forward_pass
+        if _dsv41_trace:
+            self._dsv41_tr_step = getattr(self, "_dsv41_tr_step", 0) + 1
+            _dsv41_tr = {"in": time.perf_counter()}
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
@@ -1213,6 +1217,8 @@ class Worker(WorkerBase):
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
+        if _dsv41_trace:
+            _dsv41_tr["recv_posted"] = time.perf_counter()
 
         if _dsv41_sync:
             try:
@@ -1232,6 +1238,25 @@ class Worker(WorkerBase):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+        if _dsv41_trace:
+            _dsv41_tr["launched"] = time.perf_counter()
+            _dsv41_ev = torch.cuda.Event()
+            _dsv41_ev.record()
+            _dsv41_step = self._dsv41_tr_step
+            _dsv41_rank = get_pp_group().rank_in_group
+
+            def _dsv41_tr_emit(tr=_dsv41_tr, ev=_dsv41_ev, step=_dsv41_step, rank=_dsv41_rank,
+                               T=num_scheduled_tokens):
+                if not (40 <= step <= 44):
+                    return
+                import threading
+
+                def _w():
+                    ev.synchronize()
+                    tr["gpu_done"] = time.perf_counter()
+                    logger.info("DSV41 TRACE rank %d step %d T=%d %s", rank, step, T,
+                                " ".join(f"{k}={v:.4f}" for k, v in tr.items()))
+                threading.Thread(target=_w, daemon=True).start()
         if _dsv41_prof is not None:
             torch.cuda.synchronize()
             _dsv41_prof.__exit__(None, None, None)
@@ -1241,20 +1266,28 @@ class Worker(WorkerBase):
                 tot = sum(getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)) for e in ka
                           if not getattr(e, "is_async", False))
                 lines = [f"DSV41 PROFILE rank {get_pp_group().rank_in_group} T=1 step: kernels by device time (us); "
-                         f"self-cpu total {sum(e.self_cpu_time_total for e in ka):.0f} us"]
+                         f"self-cpu total {sum(e.self_cpu_time_total for e in ka):.0f} us; device total {tot:.0f} us"]
                 for e in rows[:40]:
                     dt = getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0))
                     if dt <= 0:
                         continue
                     lines.append(f"  {dt:9.0f} us  n={e.count:4d}  {e.key[:110]}")
+                lines.append("  -- by self CPU time (us) --")
+                for e in sorted(ka, key=lambda e: -e.self_cpu_time_total)[:30]:
+                    lines.append(f"  {e.self_cpu_time_total:9.0f} us  n={e.count:4d}  {e.key[:110]}")
                 logger.info("\n".join(lines))
         if _dsv41_sync:
             torch.cuda.synchronize()
             _dsv41_t2 = time.perf_counter()
-            self._dsv41_steps = getattr(self, "_dsv41_steps", 0) + 1
-            if scheduler_output.total_num_scheduled_tokens == 1 and self._dsv41_steps % 16 == 0:
-                logger.info("DSV41 STEP T=1 recv-wait %.2f ms forward %.2f ms",
-                            (_dsv41_t1 - _dsv41_t0) * 1e3, (_dsv41_t2 - _dsv41_t1) * 1e3)
+            _T = scheduler_output.total_num_scheduled_tokens
+            if _T == 0:
+                self._dsv41_empty = getattr(self, "_dsv41_empty", 0) + 1
+            elif _T == 1:
+                self._dsv41_steps = getattr(self, "_dsv41_steps", 0) + 1
+                if self._dsv41_steps % 16 == 0:
+                    logger.info("DSV41 STEP T=1 recv-wait %.2f ms forward %.2f ms (empty calls so far %d, T=1 steps %d)",
+                                (_dsv41_t1 - _dsv41_t0) * 1e3, (_dsv41_t2 - _dsv41_t1) * 1e3,
+                                getattr(self, "_dsv41_empty", 0), self._dsv41_steps)
         if (
             self.use_v2_model_runner
             and self.model_runner.is_pooling_model
@@ -1264,6 +1297,9 @@ class Worker(WorkerBase):
         if isinstance(
             output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
         ):
+            if _dsv41_trace:
+                _dsv41_tr["out"] = time.perf_counter()
+                _dsv41_tr_emit()
             return output
 
         assert isinstance(output, IntermediateTensors)
@@ -1282,6 +1318,9 @@ class Worker(WorkerBase):
             all_gather_tensors=all_gather_tensors,
         )
         self._pp_send_work = handles[1:]
+        if _dsv41_trace:
+            _dsv41_tr["sent"] = time.perf_counter()
+            _dsv41_tr_emit()
 
         return None
 

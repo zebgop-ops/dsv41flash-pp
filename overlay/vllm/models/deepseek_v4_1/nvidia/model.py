@@ -103,6 +103,74 @@ def _dsv41_dbg_stats() -> bool:
     return _dsv41_os.environ.get("DSV41_DEBUG_STATS") == "1"
 
 
+import time as _dsv41_time
+
+
+def _dsv41_dbg_timing() -> bool:
+    return _dsv41_os.environ.get("DSV41_DEBUG_TIMING") == "1"
+
+
+def _dsv41_gdump_dir() -> str:
+    return _dsv41_os.environ.get("DSV41_DEBUG_GDUMP", "")
+
+
+import ctypes as _dsv41_C
+
+_DSV41_GD_CB = _dsv41_C.CFUNCTYPE(None, _dsv41_C.c_void_p)
+_dsv41_gd_cudart = None
+
+
+_DSV41_GD_STATE: dict = {}
+
+
+def _dsv41_gdump_layer(model, idx, hidden_states):
+    _dsv41_gdump_tensor(f"L{idx:02d}", hidden_states)
+
+
+def _dsv41_gdump_tensor(key, hidden_states):
+    """Graph-safe per-layer dump: D2H copy into a pinned buffer plus a cudaLaunchHostFunc
+    callback that writes it to disk, so it also fires on CUDA-graph replay (the ordinary
+    forward hooks do not). Files: <dir>/G<call>_L<idx>_r<rank>.npy (bf16 bits as int16)."""
+    global _dsv41_gd_cudart
+    import numpy as _np
+
+    T = hidden_states.shape[0]
+    if T > 64:
+        return
+    st = _DSV41_GD_STATE
+    idx = key
+    if idx not in st:
+        if torch.cuda.is_current_stream_capturing():
+            return  # buffers must exist before capture (warmup allocates them)
+        buf = torch.empty((64, hidden_states[0].numel()), dtype=hidden_states.dtype, device="cpu", pin_memory=True)
+        rank = get_pp_group().rank_in_group
+        d = _dsv41_gdump_dir()
+        counter = [0]
+        shape = tuple(hidden_states.shape[1:])
+
+        def cb(_):
+            n = counter[0]
+            counter[0] += 1
+            arr = buf.view(torch.int16).numpy() if buf.dtype == torch.bfloat16 else buf.numpy()
+            _np.save(f"{d}/G{n:03d}_{idx}_r{rank}.npy", arr.copy())
+
+        st[idx] = (buf, _DSV41_GD_CB(cb), shape)
+        _dsv41_os.makedirs(d, exist_ok=True)
+    buf, cbp, _ = st[idx]
+    buf[:T].copy_(hidden_states.reshape(T, -1), non_blocking=True)
+    if T < 64:
+        buf[T:].zero_()
+    if _dsv41_gd_cudart is None:
+        try:
+            _dsv41_gd_cudart = _dsv41_C.CDLL("libcudart.so.13")
+        except OSError:
+            _dsv41_gd_cudart = _dsv41_C.CDLL("libcudart.so.12")
+        _dsv41_gd_cudart.cudaLaunchHostFunc.restype = _dsv41_C.c_int
+        _dsv41_gd_cudart.cudaLaunchHostFunc.argtypes = [_dsv41_C.c_void_p, _dsv41_C.c_void_p, _dsv41_C.c_void_p]
+    stream = torch.cuda.current_stream(hidden_states.device).cuda_stream
+    _dsv41_gd_cudart.cudaLaunchHostFunc(stream, _dsv41_C.cast(cbp, _dsv41_C.c_void_p), None)
+
+
 def _dsv41_dbg_dump_dir() -> str:
     return _dsv41_os.environ.get("DSV41_DEBUG_DUMP", "")
 
@@ -435,11 +503,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # Engram injection happens between the previous sublayer's
                 # post and this block's pre, on the full hc stream, so the
                 # mix coefficients see the injected stream.
+                if _dsv41_gdump_dir():
+                    _dsv41_gdump_tensor(f"EG{self.engram.layer_hash_index}hash", engram_hashes[:, self.engram.layer_hash_index].contiguous())
+                    _dsv41_gdump_tensor(f"EG{self.engram.layer_hash_index}in", residual)
                 residual = self.engram(
                     residual,
                     engram_hashes[:, self.engram.layer_hash_index],
                     engram_mask,
                 )
+                if _dsv41_gdump_dir():
+                    _dsv41_gdump_tensor(f"EG{self.engram.layer_hash_index}out", residual)
             post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
                 residual,
                 self.hc_attn_fn,
@@ -460,7 +533,12 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if getattr(self, "_dsv41_ship_attn_input", False):
             self._dsv41_shipped_x = x
+        _gi = getattr(self, "_dsv41_idx", -1)
+        if _dsv41_gdump_dir() and 0 <= _gi < 3:
+            _dsv41_gdump_tensor(f"A{_gi:02d}in", x)
         x = self.attn(positions, x, None)
+        if _dsv41_gdump_dir() and 0 <= _gi < 3:
+            _dsv41_gdump_tensor(f"A{_gi:02d}out", x)
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
 
@@ -479,7 +557,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=self.ffn_norm.weight,
             norm_eps=self.ffn_norm.variance_epsilon,
         )
+        if _dsv41_gdump_dir() and 0 <= _gi < 3:
+            _dsv41_gdump_tensor(f"F{_gi:02d}in", x)
         x = self.ffn(x, input_ids)
+        if _dsv41_gdump_dir() and 0 <= _gi < 3:
+            _dsv41_gdump_tensor(f"F{_gi:02d}out", x)
         return x, residual, post_mix, res_mix, ffn_pre
 
 
@@ -673,6 +755,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        engram_static_meta: tuple | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -700,11 +783,31 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             attn_metadata = get_forward_context().attn_metadata
             if isinstance(attn_metadata, list):
                 attn_metadata = attn_metadata[dbo_current_ubatch_id()]
-            if isinstance(attn_metadata, dict) and self.engram_hash.ensure_cache():
+            # dsv41: engram static meta -- under PIECEWISE capture there is no
+            # attention metadata; use the runner's static buffers instead.
+            _dsv41_static = None
+            if not isinstance(attn_metadata, dict) and engram_static_meta is not None:
+                _dsv41_static = engram_static_meta
+            if (isinstance(attn_metadata, dict) or _dsv41_static is not None) and self.engram_hash.ensure_cache():
                 assert self.engram_swa_prefix is not None
-                swa_metadata = typing.cast(
-                    "DeepseekSparseSWAMetadata", attn_metadata[self.engram_swa_prefix]
-                )
+                if _dsv41_static is not None:
+                    _qsl, _slot, _bt = _dsv41_static
+                    swa_metadata = typing.cast("DeepseekSparseSWAMetadata", None)
+                    _num_reqs = _qsl.shape[0] - 1
+                else:
+                    swa_metadata = typing.cast(
+                        "DeepseekSparseSWAMetadata", attn_metadata[self.engram_swa_prefix]
+                    )
+                    _qsl, _slot, _bt = swa_metadata.query_start_loc, swa_metadata.slot_mapping, swa_metadata.block_table
+                    _num_reqs = swa_metadata.num_decodes + swa_metadata.num_prefills
+                    if engram_static_meta is not None and _dsv41_os.environ.get("DSV41_DEBUG_ENGRAM") == "1":
+                        _sq, _ss, _sb = engram_static_meta
+                        _T = input_ids.shape[0]
+                        _msg = []
+                        if not torch.equal(_sq[: _qsl.shape[0]], _qsl): _msg.append(f"qsl static {_sq[:_qsl.shape[0]+1].tolist()} vs meta {_qsl.tolist()}")
+                        if not torch.equal(_ss[:_T], _slot[:_T]): _msg.append(f"slot static {_ss[:_T].tolist()} vs meta {_slot[:_T].tolist()}")
+                        if _sb.data_ptr() != _bt.data_ptr() or _sb.stride(0) != _bt.stride(0): _msg.append(f"block_table static ptr/stride {_sb.data_ptr()}/{_sb.stride(0)} shape {tuple(_sb.shape)} vs meta {_bt.data_ptr()}/{_bt.stride(0)} shape {tuple(_bt.shape)} row0 static {_sb[0,:3].tolist()} meta {_bt[0,:3].tolist()}")
+                        logger.info("DSV41 ENGRAM-META T=%d hashblock=%d %s", _T, self.engram_hash.block_size, "; ".join(_msg) if _msg else "static == meta")
                 # Image-span tokens are dead: they break n-grams (hash op
                 # takes True=dead) and their gate is zeroed (Engram.forward
                 # takes True=keep).
@@ -716,19 +819,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                             "engram needs `lookback_token_ids` from the model "
                             "runner (the DBO/ubatch wrapper drops model kwargs)"
                         )
-                    num_reqs = swa_metadata.num_decodes + swa_metadata.num_prefills
+                    num_reqs = _num_reqs
                     lookback_token_ids = input_ids.new_full(
                         (num_reqs, self.engram_hash.lookback_depth), -1
                     )
                 engram_hashes = self.engram_hash(
                     input_ids,
                     positions,
-                    swa_metadata.query_start_loc,
+                    _qsl,
                     image_mask,
                     lookback_token_ids,
                     image_sentinel_mask(lookback_token_ids),
-                    swa_metadata.slot_mapping,
-                    swa_metadata.block_table,
+                    _slot[: input_ids.shape[0]],
+                    _bt,
                 )
             elif get_engram_dp_size() > 1:
                 # The lookup is collective once DP replicas share a table, so
@@ -778,6 +881,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            if _dsv41_gdump_dir():
+                layer._dsv41_idx = idx
             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
                 hidden_states,
                 positions,
@@ -803,6 +908,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                          "positions": positions.detach().cpu(),
                          "input_ids": input_ids.detach().cpu() if input_ids is not None else None},
                         f"{_d}/{_tag}.pt")
+            if _dsv41_gdump_dir():
+                _dsv41_gdump_layer(self, idx, hidden_states)
+            if _dsv41_dbg_timing():
+                torch.cuda.synchronize()
+                _now = _dsv41_time.perf_counter()
+                if idx == self.start_layer:
+                    self._dsv41_t_prev = _now; self._dsv41_t_first = _now
+                    self._dsv41_tick = getattr(self, "_dsv41_tick", 0) + 1
+                if hidden_states.shape[0] == 1 and self._dsv41_tick % 16 == 0:
+                    logger.info("TIMING L%d T=%d layer %.2f ms cum %.2f ms", idx, hidden_states.shape[0],
+                                (_now - self._dsv41_t_prev) * 1e3, (_now - self._dsv41_t_first) * 1e3)
+                self._dsv41_t_prev = _now
             if _dsv41_dbg_stats():
                 _h = hidden_states.float()
                 _r = residual.float() if residual is not None else _h
@@ -1273,6 +1390,7 @@ class DeepseekV41LLMForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        engram_static_meta: tuple | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids,
@@ -1280,6 +1398,7 @@ class DeepseekV41LLMForCausalLM(
             intermediate_tensors,
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
+            engram_static_meta=engram_static_meta,
         )
         return hidden_states
 

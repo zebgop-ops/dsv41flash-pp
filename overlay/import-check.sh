@@ -1,7 +1,7 @@
 #!/bin/bash
 # CPU-only import check of the overlaid modules inside the image (no GPU needed).
 IMG=${DSV41_IMG:-vllm/vllm-openai:deepseekv41-flash-0909}
-RUNDIR=${DSV41_RUNDIR:-$(cd "$(dirname "$0")/.." && pwd)}
+RUNDIR=/home/r/dsv41-run
 MOUNTS=()
 while IFS= read -r f; do rel=${f#"$RUNDIR/overlay/vllm/"}; MOUNTS+=(-v "$f:/usr/local/lib/python3.12/dist-packages/vllm/$rel:ro"); done < <(find "$RUNDIR/overlay/vllm" -type f -name '*.py')
 docker run -i --rm "${MOUNTS[@]}" -v "$RUNDIR/overlay/engram_ssd:/opt/dsv41/engram_ssd:ro" -v "$RUNDIR/overlay/hybrid:/opt/dsv41/hybrid:ro" -v "$RUNDIR/kt/site:/opt/dsv41/kt-site:ro" \

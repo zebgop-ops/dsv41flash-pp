@@ -293,6 +293,18 @@ def _cpu_forward_impl(self, hidden_states, router_logits, shared_experts_input,
         topk_indices_dtype=torch.int32,
         input_ids=input_ids,
     )
+    # Padded rows (CUDA-graph batch padding) must not reach the CPU kernel: they
+    # cost a full expert pass each and change which rows share an expert (and
+    # therefore the accumulation path) for the real rows. The runner publishes a
+    # static per-step mask in the forward context (patch_pad_mask.py).
+    try:
+        from vllm.forward_context import get_forward_context as _gfc
+
+        _pad = getattr(_gfc(), "is_padding", None)
+    except Exception:
+        _pad = None
+    if _pad is not None and _pad.shape[0] >= topk_ids.shape[0]:
+        topk_ids = topk_ids.masked_fill(_pad[: topk_ids.shape[0]].unsqueeze(1), -1)
     routed = cpu.forward(hidden_states, topk_weights.float(), topk_ids)
     routed = routed.view_as(hidden_states)
     return self._maybe_combine(shared, routed)

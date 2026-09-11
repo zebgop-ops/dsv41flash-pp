@@ -196,3 +196,76 @@ exact rows, 4.2 M rows/s warm.
   partition 8,12,8,12, CPU layers 16-19,35-39 (9), util 0.97, KV 933k tokens. Pinned staging must be pageable
   (torch caches pinned blocks -> host OOM). Autotune guard for Triton under capture (mqa_logits_triton.py) and
   warmup for block 128. Worker debug hooks: DSV41_DEBUG_SYNC/TIMING/PROFILE.
+- 2026-09-11 09:50 PT — GOAL MET: steady-state decode 16.6-16.9 tok/s (engine windows; 600-token completion
+  36.4 s wall incl. prefill), 24.3 tok/s aggregate @4 streams, prefill ~100 tok/s; needle 5.5k and 29k RECALL OK;
+  smoke answers unchanged. Launcher defaults updated (8,12,8,12 / 16-19,35-39 / util 0.97 / FULL_AND_PIECEWISE).
+  Repo zebgop-ops/dsv41flash-pp updated (commit 17128a6). servers-top.py comment refreshed.
+- 2026-09-11 15:30 PT — /goal spec decode. n-gram spec under PP: V1 runner crashed (drafter missing on non-last
+  ranks -> patch_v1_spec_pp.py) then IndexError/corruption in PP token bookkeeping (scheduler sends only the
+  scheduled non-draft token; worker's num_new_tokens drifts) -> patch_pp_spec_tokens.py (scheduler tracks
+  per-request sent position, worker appends exactly what it gets). Prose acceptance 15% -> 7.9 tok/s (loss);
+  outputs diverged from no-spec at the first draft step. Root cause found via graph-safe per-layer dumps
+  (DSV41_DEBUG_GDUMP, cudaLaunchHostFunc callbacks that fire on graph replay): layer 0 replay == eager,
+  layer 1 (first Engram layer) diverges. The model computes Engram hashes only when attn_metadata is a dict;
+  PIECEWISE capture runs with attn_metadata=None, so piecewise graphs (small prefills, mixed and non-uniform
+  spec batches) contain NO Engram injection -> boot/state-dependent logits (~1-2 nats), "Paris" flips.
+  FULL decode graphs capture with real metadata (Engram present). Fix candidates: FULL_DECODE_ONLY (prefill
+  eager) now; static-metadata Engram hashing under piecewise capture later.
+- 2026-09-11 18:30 PT — spec decode, root causes and fixes so far (all in overlay/): (1) V1 runner: non-last PP
+  ranks lacked `drafter` (patch_v1_spec_pp); (2) PP token bookkeeping: scheduler now sends every unseen token
+  (patch_pp_spec_tokens), worker appends exactly; (3) PP batch queue scheduled a request again while in flight
+  -> drafts-only steps, negative logits indices (scheduler guard in the same patch); (4) PIECEWISE graphs were
+  captured with attn_metadata=None -> no Engram hashing (patch_engram_piecewise: static qsl/slot/block-table
+  buffers from the runner) and the PP shadow-source update was baked in as a no-op (pp_shadow.run is now a
+  breakable-cudagraph eager segment); (5) padded rows reached the CPU experts (4x cost, changed accumulation
+  grouping) -> ForwardContext.is_padding published per step (patch_pad_mask) and masked in cpu_experts.py;
+  (6) prefill-shaped batches run eagerly instead of piecewise (patch_prefill_eager). Verification: with
+  FULL_DECODE_ONLY, logprobs == eager (0.000) on all probes; PIECEWISE decode == eager after (4)+(shadow);
+  eager itself is NOT batch-invariant (concurrent vs sequential prefill: up to 2.2 nats on tail tokens, top-1
+  same), so remaining ~0.5-nat deviations under spec (padded 4-row graphs) are batch-shape numerics.
+  n-gram k=3: code-edit 97% draft acceptance (2.9/step), output identical to no-spec; prose acceptance 40-50%
+  with min 3, decode 12.7 tok/s vs 16.3 no-spec (padding + drafts) -> trying explicit capture sizes 1..4 and
+  prompt_lookup_min 5.
+- 2026-09-11 18:05 PT — capture sizes [1,2,3,4,8,16] + FULL_AND_PIECEWISE: vLLM's adjust_cudagraph_sizes_for_spec_decode
+  rounds every size up to a multiple of (K+1)=4 whenever decode_mode == FULL -> only 4/8/16 survive; prose (n-gram
+  min 5, almost no drafts) 11.6 tok/s = pure padding cost (1 real row -> 4). code-edit 14.8 tok/s, output identical.
+  Next: PIECEWISE (no rounding) with sizes 1..4 so no-draft steps run a 1-row graph.
+- 2026-09-11 19:50 PT — q1 FULL graphs (overlay/patch_full_q1.py, DSV41_FULL_Q1=1): the dispatcher gets a second
+  family of FULL decode graphs with query length 1 (num_tokens == num_reqs) and the K+1 rounding of capture sizes
+  is skipped; draft-less steps now replay a 1-row FULL graph (DISPATCH log: tokens=1 -> FULL num_reqs=1 uniform)
+  and lpcheck == eager (0.000) on all probes. Prose still ~12.5 tok/s in specbench (thinking on) vs 16.3 no-spec.
+  Instrumentation added: DSV41_DEBUG_CORE=1 (engine-core phase means; overlay/vllm/v1/engine/core.py),
+  DSV41_DEBUG_TRACE=1 (cross-rank timeline of steps 40-44: worker in/recv_posted/launched/sent/gpu_done +
+  core exec_issue; tools/tracetl.py), DSV41_DEBUG_SYNC step lines now count only T=1 steps, profiler prints a
+  self-CPU table (tools/profcpu.sh). Findings: with spec the engine core blocks in take_draft_token_ids for the
+  whole step (harmless for 1 request) and issues 3 empty execute_model RPCs/step (batch queue depth 4 vs 1);
+  numba thread pool is not the cause (NUMBA_NUM_THREADS=1 no change); per-kernel device times equal on rank 3,
+  ~20% slower on ranks 0/1 in one profile (clock/contention noise?). Spec-on trace: rank1 GPU segment 23-29 ms
+  (expected ~16 = 6 GPU + 9.6 CPU MoE), rank3 21-33 ms (expected ~20) -> CPU-expert host functions look
+  contended; box has gnome-shell at 300-400% CPU during generation. Streaming (thinking off) spec-on: 61-70
+  ms/step, 400 tok in 26.5-27.2 s. Next: same trace/streaming on no-spec for an apples-to-apples comparison.
+- 2026-09-11 20:10 PT — ROOT CAUSE of the draft-less-step gap: vLLM enables *async scheduling* by default
+  (config/vllm.py) and disables it for CPU "ngram" speculation. No-spec PP therefore overlaps the engine round
+  trip + rank-0 host prep (~4.5 ms) + graph launch with the previous step (sampled ids reach ranks 0-2 by GPU
+  broadcast, `_pp_broadcast_prev_sampled_token_ids`); with ngram spec the engine is synchronous: schedule ->
+  exec RPC -> rank-0 prep -> ... -> sample -> take_draft RPC -> next. Trace (DSV41_DEBUG_TRACE): spec-on 1-token
+  step ~65 ms = rank0 prep 4.5 + GPU chain 57 (rank0 6, rank1 23, rank2 4, rank3 24) + engine ~3; no-spec ~58.
+  Streaming (thinking off): spec 61-70 ms/chunk vs no-spec 58-60. The rest of specbench's prose gap is failed
+  draft steps: a 4-token verify step costs ~2.5x a 1-token step (CPU experts: up to 4x expert traffic per layer;
+  code-edit 107 steps in ~17.7 s). ngram_gpu would keep async scheduling but PP+async asserts sampled ids
+  [num_reqs,1] and the invalid-draft trimming needs a cross-rank broadcast -> not pursued (gain <= ~3 ms).
+  Decision: keep CPU ngram; pick K and prompt_lookup_min by measurement (K=2 vs 3, min 5).
+- 2026-09-11 20:45 PT — K sweep (prompt_lookup_min 5, max 8, q1 FULL graphs, sizes 1..4 + multiples of K+1):
+  K=3: lpcheck 0.000; specbench prose 14.1 tok/s (5 draft steps, 80% acc) vs no-spec 16.3-16.8; code-edit
+  15.3 tok/s (97% acc, 2.91/step) vs 12.4-12.7, output identical; streaming prose (thinking off) 26.1/27.9 s
+  vs 21.8/25.2 no-spec; streaming code-edit 23.3 s (129 steps / 400 tokens). Launcher now derives CG mode
+  (FULL_AND_PIECEWISE when DSV41_SPEC>0, else FULL_DECODE_ONLY) and capture sizes from DSV41_SPEC/DSV41_SEQS
+  (DSV41_CG_SIZES overrides); ngram_gpu dropped (crashes on rank 0: token_ids_gpu_tensor missing; PP+async
+  unsupported upstream). Repo synced (new patches, tools, FINDINGS §7, README); RESULTS pending K=2.
+- 2026-09-11 21:05 PT — GOAL (spec decode) DONE, launcher defaults: DSV41_SPEC=3, ngram min 5 / max 8,
+  FULL_AND_PIECEWISE with capture sizes [1,2,3,4,8,12,16]. Final run with defaults: lpcheck 0.000 on all probes;
+  code-edit 15.1 tok/s incl. prefill (97% accepted, 2.91/step, greedy output identical to no-spec), streaming
+  code 23.5 s / 400 tokens (129 steps); prose 13.6-14.3 tok/s (vs 16.3-16.8 no-spec), streaming 26.0/27.9 s.
+  K=2 tied on prose (14.3) and lost on code (14.3 vs 15.3). DSV41_SPEC=0 restores the no-spec path unchanged.
+  Repo dsv41flash-pp updated (patches, tools, FINDINGS §7, RESULTS spec table, README); servers-top/web notes
+  updated (servers-web.service restart is the user's call).

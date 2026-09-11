@@ -997,7 +997,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
                  block // HEAD_TILE_SIZE * BLOCK_TILE_SIZE * HEAD_TILE_SIZE
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/nvidia/model.py vllm/models/deepseek_v4_1/nvidia/model.py
 --- image-official/models/deepseek_v4_1/nvidia/model.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/models/deepseek_v4_1/nvidia/model.py	2026-09-10 22:09:34.122233362 -0700
++++ vllm/models/deepseek_v4_1/nvidia/model.py	2026-09-11 10:07:45.798943871 -0700
 @@ -24,6 +24,29 @@
      mhc_pre_delayed_tilelang,
  )
@@ -1028,7 +1028,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
  from vllm.model_executor.layers.fused_moe import (
      fused_moe_make_expert_params_mapping,
  )
-@@ -73,6 +96,62 @@
+@@ -73,6 +96,130 @@
  from vllm.sequence import IntermediateTensors
  from vllm.utils.math_utils import cdiv
  from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -1037,6 +1037,74 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
 +
 +def _dsv41_dbg_stats() -> bool:
 +    return _dsv41_os.environ.get("DSV41_DEBUG_STATS") == "1"
++
++
++import time as _dsv41_time
++
++
++def _dsv41_dbg_timing() -> bool:
++    return _dsv41_os.environ.get("DSV41_DEBUG_TIMING") == "1"
++
++
++def _dsv41_gdump_dir() -> str:
++    return _dsv41_os.environ.get("DSV41_DEBUG_GDUMP", "")
++
++
++import ctypes as _dsv41_C
++
++_DSV41_GD_CB = _dsv41_C.CFUNCTYPE(None, _dsv41_C.c_void_p)
++_dsv41_gd_cudart = None
++
++
++_DSV41_GD_STATE: dict = {}
++
++
++def _dsv41_gdump_layer(model, idx, hidden_states):
++    _dsv41_gdump_tensor(f"L{idx:02d}", hidden_states)
++
++
++def _dsv41_gdump_tensor(key, hidden_states):
++    """Graph-safe per-layer dump: D2H copy into a pinned buffer plus a cudaLaunchHostFunc
++    callback that writes it to disk, so it also fires on CUDA-graph replay (the ordinary
++    forward hooks do not). Files: <dir>/G<call>_L<idx>_r<rank>.npy (bf16 bits as int16)."""
++    global _dsv41_gd_cudart
++    import numpy as _np
++
++    T = hidden_states.shape[0]
++    if T > 64:
++        return
++    st = _DSV41_GD_STATE
++    idx = key
++    if idx not in st:
++        if torch.cuda.is_current_stream_capturing():
++            return  # buffers must exist before capture (warmup allocates them)
++        buf = torch.empty((64, hidden_states[0].numel()), dtype=hidden_states.dtype, device="cpu", pin_memory=True)
++        rank = get_pp_group().rank_in_group
++        d = _dsv41_gdump_dir()
++        counter = [0]
++        shape = tuple(hidden_states.shape[1:])
++
++        def cb(_):
++            n = counter[0]
++            counter[0] += 1
++            arr = buf.view(torch.int16).numpy() if buf.dtype == torch.bfloat16 else buf.numpy()
++            _np.save(f"{d}/G{n:03d}_{idx}_r{rank}.npy", arr.copy())
++
++        st[idx] = (buf, _DSV41_GD_CB(cb), shape)
++        _dsv41_os.makedirs(d, exist_ok=True)
++    buf, cbp, _ = st[idx]
++    buf[:T].copy_(hidden_states.reshape(T, -1), non_blocking=True)
++    if T < 64:
++        buf[T:].zero_()
++    if _dsv41_gd_cudart is None:
++        try:
++            _dsv41_gd_cudart = _dsv41_C.CDLL("libcudart.so.13")
++        except OSError:
++            _dsv41_gd_cudart = _dsv41_C.CDLL("libcudart.so.12")
++        _dsv41_gd_cudart.cudaLaunchHostFunc.restype = _dsv41_C.c_int
++        _dsv41_gd_cudart.cudaLaunchHostFunc.argtypes = [_dsv41_C.c_void_p, _dsv41_C.c_void_p, _dsv41_C.c_void_p]
++    stream = torch.cuda.current_stream(hidden_states.device).cuda_stream
++    _dsv41_gd_cudart.cudaLaunchHostFunc(stream, _dsv41_C.cast(cbp, _dsv41_C.c_void_p), None)
 +
 +
 +def _dsv41_dbg_dump_dir() -> str:
@@ -1091,7 +1159,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
  from vllm.v1.worker.ubatching import dbo_current_ubatch_id
  
  from ..common.engram import (
-@@ -127,6 +206,17 @@
+@@ -127,6 +274,17 @@
      """
      backend = vllm_config.attention_config.backend
      device_capability = current_platform.get_device_capability()
@@ -1109,16 +1177,51 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
      if backend in (
          AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
          AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
-@@ -368,6 +458,8 @@
+@@ -345,11 +503,16 @@
+                 # Engram injection happens between the previous sublayer's
+                 # post and this block's pre, on the full hc stream, so the
+                 # mix coefficients see the injected stream.
++                if _dsv41_gdump_dir():
++                    _dsv41_gdump_tensor(f"EG{self.engram.layer_hash_index}hash", engram_hashes[:, self.engram.layer_hash_index].contiguous())
++                    _dsv41_gdump_tensor(f"EG{self.engram.layer_hash_index}in", residual)
+                 residual = self.engram(
+                     residual,
+                     engram_hashes[:, self.engram.layer_hash_index],
+                     engram_mask,
+                 )
++                if _dsv41_gdump_dir():
++                    _dsv41_gdump_tensor(f"EG{self.engram.layer_hash_index}out", residual)
+             post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
+                 residual,
+                 self.hc_attn_fn,
+@@ -368,7 +531,14 @@
          if self.use_sequence_parallel:
              x = sp_all_gather(x)[: positions.shape[0]]
  
 +        if getattr(self, "_dsv41_ship_attn_input", False):
 +            self._dsv41_shipped_x = x
++        _gi = getattr(self, "_dsv41_idx", -1)
++        if _dsv41_gdump_dir() and 0 <= _gi < 3:
++            _dsv41_gdump_tensor(f"A{_gi:02d}in", x)
          x = self.attn(positions, x, None)
++        if _dsv41_gdump_dir() and 0 <= _gi < 3:
++            _dsv41_gdump_tensor(f"A{_gi:02d}out", x)
          if self.use_sequence_parallel:
              x = sp_reduce_scatter(x)
-@@ -454,6 +546,28 @@
+ 
+@@ -387,7 +557,11 @@
+             norm_weight=self.ffn_norm.weight,
+             norm_eps=self.ffn_norm.variance_epsilon,
+         )
++        if _dsv41_gdump_dir() and 0 <= _gi < 3:
++            _dsv41_gdump_tensor(f"F{_gi:02d}in", x)
+         x = self.ffn(x, input_ids)
++        if _dsv41_gdump_dir() and 0 <= _gi < 3:
++            _dsv41_gdump_tensor(f"F{_gi:02d}out", x)
+         return x, residual, post_mix, res_mix, ffn_pre
+ 
+ 
+@@ -454,6 +628,28 @@
  
          self.engram_layout = EngramLayout.from_config(config)
  
@@ -1147,7 +1250,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          self.start_layer, self.end_layer, self.layers = make_layers(
              config.num_hidden_layers,
              lambda prefix: DeepseekV4DecoderLayer(
-@@ -467,6 +581,13 @@
+@@ -467,6 +663,13 @@
              prefix=f"{prefix}.layers",
          )
  
@@ -1161,7 +1264,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          # The n-gram hash needs a slot-keyed rolling store of compressed ids
          # (chunked prefill / decode lookback); key it off the first local
          # layer's sliding-window KV cache. Only PP ranks owning an engram
-@@ -521,20 +642,29 @@
+@@ -521,20 +724,29 @@
          # layer and keeps that shape until the final hc collapse — plus the
          # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
          # for its attention collapse.
@@ -1205,7 +1308,75 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
  
      def forward(
          self,
-@@ -630,6 +760,18 @@
+@@ -543,6 +755,7 @@
+         intermediate_tensors: IntermediateTensors | None,
+         inputs_embeds: torch.Tensor | None = None,
+         lookback_token_ids: torch.Tensor | None = None,
++        engram_static_meta: tuple | None = None,
+     ) -> torch.Tensor | IntermediateTensors:
+         if get_pp_group().is_first_rank:
+             if inputs_embeds is not None:
+@@ -570,11 +783,31 @@
+             attn_metadata = get_forward_context().attn_metadata
+             if isinstance(attn_metadata, list):
+                 attn_metadata = attn_metadata[dbo_current_ubatch_id()]
+-            if isinstance(attn_metadata, dict) and self.engram_hash.ensure_cache():
++            # dsv41: engram static meta -- under PIECEWISE capture there is no
++            # attention metadata; use the runner's static buffers instead.
++            _dsv41_static = None
++            if not isinstance(attn_metadata, dict) and engram_static_meta is not None:
++                _dsv41_static = engram_static_meta
++            if (isinstance(attn_metadata, dict) or _dsv41_static is not None) and self.engram_hash.ensure_cache():
+                 assert self.engram_swa_prefix is not None
+-                swa_metadata = typing.cast(
+-                    "DeepseekSparseSWAMetadata", attn_metadata[self.engram_swa_prefix]
+-                )
++                if _dsv41_static is not None:
++                    _qsl, _slot, _bt = _dsv41_static
++                    swa_metadata = typing.cast("DeepseekSparseSWAMetadata", None)
++                    _num_reqs = _qsl.shape[0] - 1
++                else:
++                    swa_metadata = typing.cast(
++                        "DeepseekSparseSWAMetadata", attn_metadata[self.engram_swa_prefix]
++                    )
++                    _qsl, _slot, _bt = swa_metadata.query_start_loc, swa_metadata.slot_mapping, swa_metadata.block_table
++                    _num_reqs = swa_metadata.num_decodes + swa_metadata.num_prefills
++                    if engram_static_meta is not None and _dsv41_os.environ.get("DSV41_DEBUG_ENGRAM") == "1":
++                        _sq, _ss, _sb = engram_static_meta
++                        _T = input_ids.shape[0]
++                        _msg = []
++                        if not torch.equal(_sq[: _qsl.shape[0]], _qsl): _msg.append(f"qsl static {_sq[:_qsl.shape[0]+1].tolist()} vs meta {_qsl.tolist()}")
++                        if not torch.equal(_ss[:_T], _slot[:_T]): _msg.append(f"slot static {_ss[:_T].tolist()} vs meta {_slot[:_T].tolist()}")
++                        if _sb.data_ptr() != _bt.data_ptr() or _sb.stride(0) != _bt.stride(0): _msg.append(f"block_table static ptr/stride {_sb.data_ptr()}/{_sb.stride(0)} shape {tuple(_sb.shape)} vs meta {_bt.data_ptr()}/{_bt.stride(0)} shape {tuple(_bt.shape)} row0 static {_sb[0,:3].tolist()} meta {_bt[0,:3].tolist()}")
++                        logger.info("DSV41 ENGRAM-META T=%d hashblock=%d %s", _T, self.engram_hash.block_size, "; ".join(_msg) if _msg else "static == meta")
+                 # Image-span tokens are dead: they break n-grams (hash op
+                 # takes True=dead) and their gate is zeroed (Engram.forward
+                 # takes True=keep).
+@@ -586,19 +819,19 @@
+                             "engram needs `lookback_token_ids` from the model "
+                             "runner (the DBO/ubatch wrapper drops model kwargs)"
+                         )
+-                    num_reqs = swa_metadata.num_decodes + swa_metadata.num_prefills
++                    num_reqs = _num_reqs
+                     lookback_token_ids = input_ids.new_full(
+                         (num_reqs, self.engram_hash.lookback_depth), -1
+                     )
+                 engram_hashes = self.engram_hash(
+                     input_ids,
+                     positions,
+-                    swa_metadata.query_start_loc,
++                    _qsl,
+                     image_mask,
+                     lookback_token_ids,
+                     image_sentinel_mask(lookback_token_ids),
+-                    swa_metadata.slot_mapping,
+-                    swa_metadata.block_table,
++                    _slot[: input_ids.shape[0]],
++                    _bt,
+                 )
+             elif get_engram_dp_size() > 1:
+                 # The lookup is collective once DP replicas share a table, so
+@@ -630,12 +863,26 @@
          if not get_pp_group().is_first_rank:
              assert intermediate_tensors is not None
              pre_mix = intermediate_tensors["pre_mix"]
@@ -1224,7 +1395,15 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          aux_hidden_states: list[torch.Tensor] = []
          final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
          for idx, layer in enumerate(
-@@ -647,6 +789,28 @@
+             islice(self.layers, self.start_layer, self.end_layer),
+             start=self.start_layer,
+         ):
++            if _dsv41_gdump_dir():
++                layer._dsv41_idx = idx
+             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+                 hidden_states,
+                 positions,
+@@ -647,6 +894,40 @@
                  engram_hashes,
                  engram_mask,
              )
@@ -1242,6 +1421,18 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
 +                         "positions": positions.detach().cpu(),
 +                         "input_ids": input_ids.detach().cpu() if input_ids is not None else None},
 +                        f"{_d}/{_tag}.pt")
++            if _dsv41_gdump_dir():
++                _dsv41_gdump_layer(self, idx, hidden_states)
++            if _dsv41_dbg_timing():
++                torch.cuda.synchronize()
++                _now = _dsv41_time.perf_counter()
++                if idx == self.start_layer:
++                    self._dsv41_t_prev = _now; self._dsv41_t_first = _now
++                    self._dsv41_tick = getattr(self, "_dsv41_tick", 0) + 1
++                if hidden_states.shape[0] == 1 and self._dsv41_tick % 16 == 0:
++                    logger.info("TIMING L%d T=%d layer %.2f ms cum %.2f ms", idx, hidden_states.shape[0],
++                                (_now - self._dsv41_t_prev) * 1e3, (_now - self._dsv41_t_first) * 1e3)
++                self._dsv41_t_prev = _now
 +            if _dsv41_dbg_stats():
 +                _h = hidden_states.float()
 +                _r = residual.float() if residual is not None else _h
@@ -1253,7 +1444,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
              if idx + 1 in self.aux_hidden_state_layers:
                  # Reconstruct the aux hidden state for draft models
                  aux_recon = mhc_post_tilelang(
-@@ -667,9 +831,20 @@
+@@ -667,9 +948,20 @@
                  )
  
          if not get_pp_group().is_last_rank:
@@ -1277,7 +1468,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
  
          # MTP needs full HC states; otherwise collapse and normalize locally
          # before gathering to reduce communication.
-@@ -726,6 +901,9 @@
+@@ -726,6 +1018,9 @@
          )
  
          for name, loaded_weight in weights:
@@ -1287,7 +1478,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
              if name.startswith(("vision.", "aligner.", "image_")):
                  # Vision weights are loaded by the outer multimodal wrapper.
                  logger.warning_once("Skipping non-text weight: %s", name)
-@@ -1038,6 +1216,7 @@
+@@ -1038,6 +1333,7 @@
          )
  
          self.set_moe_parameters()
@@ -1295,7 +1486,23 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
  
      def set_moe_parameters(self) -> None:
          self.num_expert_groups = getattr(self.config, "n_group", 1)
-@@ -1119,6 +1298,7 @@
+@@ -1094,6 +1390,7 @@
+         intermediate_tensors: IntermediateTensors | None = None,
+         inputs_embeds: torch.Tensor | None = None,
+         lookback_token_ids: torch.Tensor | None = None,
++        engram_static_meta: tuple | None = None,
+     ) -> torch.Tensor | IntermediateTensors:
+         hidden_states = self.model(
+             input_ids,
+@@ -1101,6 +1398,7 @@
+             intermediate_tensors,
+             inputs_embeds,
+             lookback_token_ids=lookback_token_ids,
++            engram_static_meta=engram_static_meta,
+         )
+         return hidden_states
+ 
+@@ -1119,6 +1417,7 @@
      def process_weights_after_loading(self) -> None:
          self.model.finalize_mega_moe_weights()
          self.model.finalize_mhc_broadcast_weights()
@@ -1303,6 +1510,25 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
  
      def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
          return self.model.get_expert_mapping()
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/nvidia/vl_model.py vllm/models/deepseek_v4_1/nvidia/vl_model.py
+--- image-official/models/deepseek_v4_1/nvidia/vl_model.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4_1/nvidia/vl_model.py	2026-09-11 08:44:20.892950860 -0700
+@@ -312,6 +312,7 @@
+         intermediate_tensors=None,
+         inputs_embeds: torch.Tensor | None = None,
+         lookback_token_ids: torch.Tensor | None = None,
++        engram_static_meta: tuple | None = None,
+         **kwargs,
+     ) -> torch.Tensor:
+         return self.language_model(
+@@ -320,6 +321,7 @@
+             intermediate_tensors,
+             inputs_embeds,
+             lookback_token_ids=lookback_token_ids,
++            engram_static_meta=engram_static_meta,
+         )
+ 
+     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/utils/multi_stream_utils.py vllm/utils/multi_stream_utils.py
 --- image-official/utils/multi_stream_utils.py	2026-09-09 23:38:04.000000000 -0700
 +++ vllm/utils/multi_stream_utils.py	2026-09-10 16:15:26.271952064 -0700
@@ -2229,10 +2455,271 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/core
          elif group.layer_names:
              layers_by_spec[group_spec].extend(group.layer_names)
  
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/core/sched/scheduler.py vllm/v1/core/sched/scheduler.py
+--- image-official/v1/core/sched/scheduler.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/core/sched/scheduler.py	2026-09-11 08:44:06.448574221 -0700
+@@ -590,6 +590,17 @@
+                 req_index += 1
+                 continue
+ 
++            # dsv41: under PP (non-async) the engine schedules ahead while the
++            # previous step is in flight; only drafts would be schedulable for a
++            # request whose real tokens are all computed -> wait for its output.
++            if (
++                self.use_pp
++                and not self.scheduler_config.async_scheduling
++                and request.num_tokens + request.num_output_placeholders
++                <= request.num_computed_tokens
++            ):
++                req_index += 1
++                continue
+             num_new_tokens = (
+                 request.num_tokens_with_spec
+                 + request.num_output_placeholders
+@@ -1579,9 +1590,12 @@
+                 num_tokens = num_scheduled_tokens[req_id] - len(
+                     spec_decode_tokens.get(req_id, ())
+                 )
+-                token_ids = req.all_token_ids[
+-                    req.num_computed_tokens : req.num_computed_tokens + num_tokens
+-                ]
++                # dsv41: send every token the workers have not seen yet (accepted
++                # draft tokens included), not just the one scheduled this step.
++                end = req.num_computed_tokens + num_tokens
++                sent = max(self._dsv41_pp_sent.get(req_id, 0), req.num_prompt_tokens)
++                token_ids = req.all_token_ids[sent:end]
++                self._dsv41_pp_sent[req_id] = max(sent, end)
+                 new_token_ids.append(token_ids)
+             if idx >= num_running_reqs:
+                 resumed_req_ids.add(req_id)
+@@ -2486,9 +2500,17 @@
+ 
+         return valid_requests
+ 
++    @property
++    def _dsv41_pp_sent(self) -> dict[str, int]:
++        d = self.__dict__.get("_dsv41_pp_sent_dict")
++        if d is None:
++            d = self.__dict__["_dsv41_pp_sent_dict"] = {}
++        return d
++
+     def _free_request(
+         self, request: Request, delay_free_blocks: bool = False
+     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
++        self._dsv41_pp_sent.pop(request.request_id, None)
+         assert request.is_finished()
+ 
+         self._inflight_prefills.discard(request)
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/cudagraph_dispatcher.py vllm/v1/cudagraph_dispatcher.py
+--- image-official/v1/cudagraph_dispatcher.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/cudagraph_dispatcher.py	2026-09-11 11:17:18.868612730 -0700
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Set as AbstractSet
++import os
+ from dataclasses import replace
+ from itertools import product
+ 
+@@ -135,12 +136,27 @@
+         uniform_decode: bool,
+         has_lora: bool,
+         num_active_loras: int = 0,
++        uniform_query_len: int | None = None,
+     ) -> BatchDescriptor:
+         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+-        uniform_decode_query_len = self.uniform_decode_query_len
++        # dsv41 q1: the caller may name the uniform query length (1 for draft-less steps)
++        uniform_decode_query_len = uniform_query_len or self.uniform_decode_query_len
+         num_tokens_padded = self._bs_to_padded_graph_size[num_tokens]
+ 
+         if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
++            if num_tokens_padded % uniform_decode_query_len != 0:
++                # capture sizes are no longer rounded to multiples of (K+1): pick the
++                # next size that is, or give up on a uniform (FULL) dispatch
++                cands = [
++                    s
++                    for s in self.compilation_config.cudagraph_capture_sizes
++                    if s >= num_tokens and s % uniform_decode_query_len == 0
++                ]
++                if cands:
++                    num_tokens_padded = cands[0]
++                else:
++                    uniform_decode = False
++        if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
+             num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)
+             assert num_tokens_padded % uniform_decode_query_len == 0
+         else:
+@@ -219,6 +235,7 @@
+                 x
+                 for x in self.compilation_config.cudagraph_capture_sizes
+                 if x <= max_num_tokens and x >= uniform_decode_query_len
++                and x % uniform_decode_query_len == 0  # dsv41 q1: sizes are unrounded
+             ]
+             for bs, num_active_loras in product(
+                 cudagraph_capture_sizes_for_decode, lora_cases
+@@ -229,6 +246,25 @@
+                         bs, True, num_active_loras > 0, num_active_loras
+                     ),
+                 )
++            # dsv41 q1: a second family of FULL decode graphs with query length 1 for
++            # steps in which the drafter proposed nothing (num_tokens == num_reqs)
++            if uniform_decode_query_len > 1 and os.environ.get("DSV41_FULL_Q1", "1") == "1":
++                max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
++                for bs, num_active_loras in product(
++                    [
++                        x
++                        for x in self.compilation_config.cudagraph_capture_sizes
++                        if x <= max_num_seqs
++                    ],
++                    lora_cases,
++                ):
++                    self.add_cudagraph_key(
++                        CUDAGraphMode.FULL,
++                        self._create_padded_batch_descriptor(
++                            bs, True, num_active_loras > 0, num_active_loras,
++                            uniform_query_len=1,
++                        ),
++                    )
+ 
+         self.keys_initialized = True
+ 
+@@ -240,6 +276,7 @@
+         num_active_loras: int = 0,
+         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
+         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
++        uniform_query_len: int | None = None,  # dsv41 q1
+     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+         """
+         Given conditions(e.g.,batch descriptor and if using piecewise only),
+@@ -301,7 +338,8 @@
+ 
+         normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
+         batch_desc = self._create_padded_batch_descriptor(
+-            num_tokens, normalized_uniform, has_lora, effective_num_active_loras
++            num_tokens, normalized_uniform, has_lora, effective_num_active_loras,
++            uniform_query_len=uniform_query_len if normalized_uniform else None,
+         )
+ 
+         if CUDAGraphMode.FULL in allowed_modes:
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engine/core.py vllm/v1/engine/core.py
+--- image-official/v1/engine/core.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/engine/core.py	2026-09-11 12:36:04.827939280 -0700
+@@ -96,6 +96,24 @@
+ 
+ logger = init_logger(__name__)
+ 
++import os as _dsv41_os
++import time as _dsv41_time
++_DSV41_CORE = _dsv41_os.environ.get("DSV41_DEBUG_CORE") == "1"
++_DSV41_ACC: dict[str, float] = {}
++_DSV41_CNT: dict[str, int] = {}
++
++
++def _dsv41_acc(key: str, dt: float) -> None:
++    _DSV41_ACC[key] = _DSV41_ACC.get(key, 0.0) + dt
++    _DSV41_CNT[key] = _DSV41_CNT.get(key, 0) + 1
++
++
++def _dsv41_report(n_real: int) -> None:
++    if n_real % 32 == 0:
++        parts = [f"{k} {1e3 * v / max(1, _DSV41_CNT[k]):.2f}ms x{_DSV41_CNT[k]}" for k, v in sorted(_DSV41_ACC.items())]
++        logger.info("DSV41 CORE (per-call means since boot, %d real steps): %s", n_real, "; ".join(parts))
++
++
+ 
+ HANDSHAKE_TIMEOUT_MINS = 5
+ 
+@@ -642,7 +660,10 @@
+         # so we update draft token ids in the worker process and don't
+         # need to update draft token ids here.
+         if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
++            _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
+             draft_token_ids = self.model_executor.take_draft_token_ids()
++            if _DSV41_CORE:
++                _dsv41_acc("take_draft", _dsv41_time.perf_counter() - _dsv41_t)
+             if draft_token_ids is not None:
+                 self.scheduler.update_draft_token_ids(draft_token_ids)
+ 
+@@ -674,11 +695,23 @@
+         model_executed = False
+         deferred_scheduler_output = None
+         if self.scheduler.has_requests():
++            _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
+             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
++            if _DSV41_CORE:
++                _dsv41_t2 = _dsv41_time.perf_counter()
++                _dsv41_acc("schedule" if scheduler_output.total_num_scheduled_tokens else "schedule_empty", _dsv41_t2 - _dsv41_t)
++                _dsv41_t = _dsv41_t2
++            if _dsv41_os.environ.get("DSV41_DEBUG_TRACE") == "1" and scheduler_output.total_num_scheduled_tokens:
++                self._dsv41_tr_step = getattr(self, "_dsv41_tr_step", 0) + 1
++                if 40 <= self._dsv41_tr_step <= 44:
++                    logger.info("DSV41 TRACE core step %d T=%d exec_issue=%.4f", self._dsv41_tr_step,
++                                scheduler_output.total_num_scheduled_tokens, _dsv41_time.perf_counter())
+             with self.log_error_detail(scheduler_output):
+                 exec_future = self.model_executor.execute_model(
+                     scheduler_output, non_block=True
+                 )
++            if _DSV41_CORE:
++                _dsv41_acc("exec_rpc" if scheduler_output.total_num_scheduled_tokens else "exec_rpc_empty", _dsv41_time.perf_counter() - _dsv41_t)
+             if self.is_ec_consumer:
+                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
+ 
+@@ -692,9 +725,12 @@
+                     grammar_output = self.scheduler.get_grammar_bitmask(
+                         scheduler_output
+                     )
++                    _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
+                     future = self.model_executor.sample_tokens(
+                         grammar_output, non_block=True
+                     )
++                    if _DSV41_CORE:
++                        _dsv41_acc("sample_rpc", _dsv41_time.perf_counter() - _dsv41_t)
+                 else:
+                     # We need to defer sampling until we have processed the model output
+                     # from the prior step.
+@@ -718,6 +754,7 @@
+ 
+         # Block until the next result is available.
+         future, scheduler_output, exec_model_fut = batch_queue.pop()
++        _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
+         with (
+             self.capture_iteration_details(scheduler_output) as iteration_details,
+             self.log_error_detail(scheduler_output),
+@@ -728,6 +765,10 @@
+                 # call failed - raise that exception.
+                 exec_model_fut.result()
+                 raise RuntimeError("unexpected error")
++        if _DSV41_CORE:
++            _dsv41_t2 = _dsv41_time.perf_counter()
++            _dsv41_acc("wait_result" if scheduler_output.total_num_scheduled_tokens else "wait_result_empty", _dsv41_t2 - _dsv41_t)
++            _dsv41_t = _dsv41_t2
+ 
+         # Before processing the model output, process any aborts that happened
+         # during the model execution.
+@@ -736,6 +777,10 @@
+             scheduler_output, model_output
+         )
+         self._attach_iteration_details(engine_core_outputs, iteration_details)
++        if _DSV41_CORE and scheduler_output.total_num_scheduled_tokens:
++            _dsv41_acc("update_from_output", _dsv41_time.perf_counter() - _dsv41_t)
++            self._dsv41_real = getattr(self, "_dsv41_real", 0) + 1
++            _dsv41_report(self._dsv41_real)
+ 
+         # NOTE(nick): We can either handle the deferred tasks here or save
+         # in a field and do it immediately once step_with_batch_queue is
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/worker/gpu_model_runner.py vllm/v1/worker/gpu_model_runner.py
 --- image-official/v1/worker/gpu_model_runner.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/v1/worker/gpu_model_runner.py	2026-09-10 23:32:09.601455156 -0700
-@@ -159,6 +159,7 @@
++++ vllm/v1/worker/gpu_model_runner.py	2026-09-11 11:17:18.872552379 -0700
+@@ -15,6 +15,7 @@
+ from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
+ 
+ import numpy as np
++import os
+ import torch
+ import torch.distributed
+ import torch.nn as nn
+@@ -159,6 +160,7 @@
  from vllm.v1.core.sched.output import NewRequestData
  from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
  from vllm.v1.kv_cache_interface import (
@@ -2240,7 +2727,282 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
      AttentionSpec,
      ChunkedLocalAttentionSpec,
      CrossAttentionSpec,
-@@ -7388,7 +7389,17 @@
+@@ -630,6 +632,9 @@
+         # NOTE(Jiayi): currently we put the entire draft model on
+         # the last PP rank. This is not ideal if there are many
+         # layers in the draft model.
++        # dsv41: non-last PP ranks never build a drafter but the metadata builder
++        # isinstance-checks it; None makes those checks false instead of raising.
++        self.drafter = None  # type: ignore[assignment]
+         if self.speculative_config and get_pp_group().is_last_rank:
+             self.drafter: (
+                 NgramProposer  # noqa: F823
+@@ -1106,6 +1111,60 @@
+             buf.np[:num_reqs] = np.where(valid, ids, -1)
+         return buf.copy_to_gpu()
+ 
++    def _dsv41_engram_static_meta(self):
++        """Static (query_start_loc, slot_mapping, block_table) buffers of the Engram SWA
++        group so the model can hash n-grams inside PIECEWISE graph capture."""
++        prefix = self.__dict__.get("_dsv41_engram_prefix", "?")
++        if prefix == "?":
++            prefix = None
++            for m in getattr(self, "model", torch.nn.Module()).modules():
++                p = getattr(m, "engram_swa_prefix", None)
++                if p is not None:
++                    prefix = p
++                    break
++            self.__dict__["_dsv41_engram_prefix"] = prefix
++        cfg = getattr(self, "kv_cache_config", None)
++        if prefix is None or cfg is None:
++            return None
++        gid = self.__dict__.get("_dsv41_engram_gid")
++        if gid is None:
++            # index into input_batch.block_table, which skips encoder-only groups
++            bt_idx = 0
++            for g in cfg.kv_cache_groups:
++                if get_kv_cache_spec_kind(g.kv_cache_spec) == KVCacheSpecKind.ENCODER_ONLY_ATTENTION:
++                    continue
++                if prefix in g.layer_names:
++                    gid = bt_idx
++                    break
++                bt_idx += 1
++            if gid is None:
++                return None
++            self.__dict__["_dsv41_engram_gid"] = gid
++            _bt0 = self.input_batch.block_table[gid]
++            logger.info("DSV41 engram static meta: group %d (block_size %d, table %s) for %s",
++                        gid, _bt0.block_size, tuple(_bt0.block_table.gpu.shape), prefix)
++        bt = self.input_batch.block_table[gid]
++        return (self.query_start_loc.gpu, bt.slot_mapping.gpu, bt.block_table.gpu)
++
++    def _dsv41_pad_view(self, num_padded: int) -> torch.Tensor:
++        """Static bool buffer [max tokens]: True for CUDA-graph padding rows."""
++        buf = self.__dict__.get("_dsv41_pad_buf")
++        if buf is None or buf.numel() < num_padded:
++            n = max(int(num_padded), int(getattr(self, "max_num_tokens", num_padded)) * 2)
++            buf = torch.zeros(n, dtype=torch.bool, device=self.device)
++            self.__dict__["_dsv41_pad_buf"] = buf
++            self.__dict__["_dsv41_pad_cpu"] = torch.zeros(n, dtype=torch.bool, device="cpu", pin_memory=True)
++        return buf[:num_padded]
++
++    def _dsv41_pad_set(self, num_actual: int, num_padded: int) -> torch.Tensor:
++        view = self._dsv41_pad_view(num_padded)
++        cpu = self.__dict__["_dsv41_pad_cpu"]
++        cpu[:num_padded] = False
++        if num_padded > num_actual:
++            cpu[num_actual:num_padded] = True
++        view.copy_(cpu[:num_padded], non_blocking=True)
++        return view
++
+     def _init_model_kwargs(self, num_reqs: int | None = None):
+         model_kwargs = dict[str, Any]()
+ 
+@@ -1115,6 +1174,10 @@
+             model_kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
+                 num_reqs
+             )
++            # dsv41: engram static meta (see overlay/patch_engram_piecewise.py)
++            meta = self._dsv41_engram_static_meta()
++            if meta is not None:
++                model_kwargs["engram_static_meta"] = meta
+ 
+         if not self.is_pooling_model:
+             return model_kwargs
+@@ -1456,18 +1519,20 @@
+                     # sampled token ids back because there's no direct communication
+                     # between the first-stage worker and the last-stage worker.
+                     new_token_ids = req_data.new_token_ids[i]
+-                    # Add the sampled token(s) from the previous step (if any).
+-                    # This doesn't include "unverified" tokens like spec tokens.
+-                    num_new_tokens = (
+-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+-                    )
+-                    if num_new_tokens == 1:
+-                        # Avoid slicing list in most common case.
+-                        req_state.output_token_ids.append(new_token_ids[-1])
+-                    elif num_new_tokens > 0:
+-                        req_state.output_token_ids.extend(
+-                            new_token_ids[-num_new_tokens:]
+-                        )
++                    # dsv41: append exactly what the scheduler sent (it sends every
++                    # output token the worker has not seen, drafts accepted last
++                    # step included; see patch_pp_spec_tokens.py).
++                    if new_token_ids:
++                        # Re-sent tokens (re-prefill after preemption) are dropped:
++                        # the scheduler's slice ends at the current non-draft token.
++                        _end = num_computed_tokens + scheduler_output.num_scheduled_tokens[
++                            req_id
++                        ] - len(scheduled_spec_tokens.get(req_id, ()))
++                        _drop = max(0, req_state.num_tokens - (_end - len(new_token_ids)))
++                        if _drop:
++                            new_token_ids = new_token_ids[_drop:]
++                        if new_token_ids:
++                            req_state.output_token_ids.extend(new_token_ids)
+             elif num_output_tokens < len(req_state.output_token_ids):
+                 # Some output tokens were discarded due to a sync-KV-load
+                 # failure, or output_token_ids was inflated by the optimistic
+@@ -1523,18 +1588,21 @@
+                 # than num_tokens_no_spec.
+                 # Async scheduled PP: no new_token_ids, advance num_tokens_no_spec
+                 # according to num_computed_tokens.
+-                end_token_index = max(
+-                    start_token_index,
+-                    num_computed_tokens + len(new_token_ids),
+-                )
++                if new_token_ids:
++                    # dsv41: the received tokens are exactly the ones missing
++                    # from [start_token_index, ...).
++                    end_token_index = start_token_index + len(new_token_ids)
++                else:
++                    end_token_index = max(
++                        start_token_index,
++                        num_computed_tokens + len(new_token_ids),
++                    )
+                 if end_token_index > start_token_index:
+                     if new_token_ids:
+                         # Add new_token_ids to token_ids_cpu.
+-                        num_new_tokens = end_token_index - start_token_index
+-                        tokens_to_append = new_token_ids[-num_new_tokens:]
+                         self.input_batch.token_ids_cpu[
+                             req_index, start_token_index:end_token_index
+-                        ] = tokens_to_append
++                        ] = new_token_ids
+                     self.input_batch.is_token_ids[
+                         req_index, start_token_index:end_token_index
+                     ] = True
+@@ -4011,13 +4079,19 @@
+         Checks if it's a decode batch with same amount scheduled tokens
+         across all requests.
+         """
++        if force_uniform_decode is not None:
++            return force_uniform_decode
++        if (
++            (max_num_scheduled_tokens == uniform_decode_query_len)
++            and (num_tokens == max_num_scheduled_tokens * num_reqs)
++        ):
++            return True
++        # dsv41 q1: draft-less steps under spec decode are uniform with query length 1
+         return (
+-            (
+-                (max_num_scheduled_tokens == uniform_decode_query_len)
+-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+-            )
+-            if force_uniform_decode is None
+-            else force_uniform_decode
++            uniform_decode_query_len > 1
++            and max_num_scheduled_tokens == 1
++            and num_tokens == num_reqs
++            and os.environ.get("DSV41_FULL_Q1", "1") == "1"
+         )
+ 
+     def _allow_microbatching(
+@@ -4117,12 +4191,28 @@
+                 uniform_decode=uniform_decode,
+                 num_active_loras=num_active_loras,
+                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
++                uniform_query_len=max_num_scheduled_tokens if uniform_decode else None,
+                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+             )
+ 
+         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+             num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
+         )
++        # dsv41: prefill-shaped batches run eagerly instead of in piecewise graphs
++        if (
++            cudagraph_mode == CUDAGraphMode.PIECEWISE
++            and force_uniform_decode is None  # real steps only (capture/dummy runs force it)
++            and not force_eager
++            and os.environ.get("DSV41_PREFILL_EAGER", "1") == "1"
++            and max_num_scheduled_tokens > self.uniform_decode_query_len
++        ):
++            cudagraph_mode, batch_descriptor = dispatch_cudagraph(
++                num_tokens_padded, valid_modes={CUDAGraphMode.NONE}
++            )
++        if os.environ.get("DSV41_DEBUG_SPEC") == "1" and force_uniform_decode is None and num_tokens <= 8:
++            logger.info("DSV41 DISPATCH tokens=%d reqs=%d maxq=%d uniform=%s -> %s %s",
++                        num_tokens, num_reqs, max_num_scheduled_tokens, uniform_decode,
++                        cudagraph_mode, batch_descriptor)
+         num_tokens_padded = batch_descriptor.num_tokens
+         if self.compilation_config.pass_config.enable_sp:
+             assert (
+@@ -4568,6 +4658,7 @@
+                 ubatch_slices=ubatch_slices_padded,
+                 slot_mapping=slot_mappings,
+                 skip_compiled=has_encoder_input,
++                is_padding=self._dsv41_pad_set(num_tokens_unpadded, num_tokens_padded),
+             ),
+             record_function_or_nullcontext("gpu_model_runner: forward"),
+             self.maybe_get_kv_connector_output(
+@@ -5968,6 +6059,7 @@
+         num_active_loras: int = 0,
+         profile_seq_lens: int | None = None,
+         randomize_inputs: bool = False,
++        uniform_query_len: int | None = None,  # dsv41 q1
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """
+         Run a dummy forward pass to warm up/profile run or capture the
+@@ -6020,7 +6112,11 @@
+         # When setting max_query_len = 1, we switch to and capture the optimized
+         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
+         # for GQA/MQA.
+-        max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
++        max_query_len = (
++            (uniform_query_len or self.uniform_decode_query_len)
++            if uniform_decode
++            else num_tokens
++        )
+ 
+         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+         # for dummy run with LoRA so that the num_reqs collectively
+@@ -6277,6 +6373,7 @@
+                     batch_descriptor=batch_desc,
+                     ubatch_slices=ubatch_slices_padded,
+                     slot_mapping=slot_mappings,
++                    is_padding=self._dsv41_pad_view(num_tokens_padded),
+                 ),
+             ):
+                 outputs = self.model(
+@@ -7063,6 +7160,11 @@
+                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                 force_attention=force_attention,
+                 uniform_decode=desc.uniform,
++                uniform_query_len=(
++                    desc.num_tokens // desc.num_reqs
++                    if (desc.uniform and desc.num_reqs)
++                    else None
++                ),
+                 allow_microbatching=allow_microbatching,
+                 skip_eplb=True,
+                 remove_lora=False,
+@@ -7083,6 +7185,11 @@
+                 desc.num_tokens,
+                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                 uniform_decode=desc.uniform,
++                uniform_query_len=(
++                    desc.num_tokens // desc.num_reqs
++                    if (desc.uniform and desc.num_reqs)
++                    else None
++                ),
+                 allow_microbatching=allow_microbatching,
+                 skip_eplb=True,
+                 remove_lora=False,
+@@ -7311,6 +7418,14 @@
+                 if cg_support.value < min_cg_support.value:
+                     min_cg_support = cg_support
+                     min_cg_attn_backend = attn_backend.__name__
++        if (
++            self.uniform_decode_query_len > 1
++            and os.environ.get("DSV41_FULL_Q1", "1") == "1"
++        ):
++            # dsv41 q1: keep capture sizes 1..K (the dispatcher filters the K+1 family)
++            self.compilation_config.adjust_cudagraph_sizes_for_spec_decode = (
++                lambda *a, **k: None
++            )
+         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
+             min_cg_support,
+             min_cg_attn_backend,
+@@ -7388,7 +7503,17 @@
                  continue
              block_size = kv_cache_spec.block_size
              block_sizes.append(block_size)
@@ -2261,7 +3023,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
                  slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/worker/gpu_worker.py vllm/v1/worker/gpu_worker.py
 --- image-official/v1/worker/gpu_worker.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/v1/worker/gpu_worker.py	2026-09-11 02:19:23.347011924 -0700
++++ vllm/v1/worker/gpu_worker.py	2026-09-11 12:36:29.631806998 -0700
 @@ -99,6 +99,26 @@
  
  logger = init_logger(__name__)
@@ -2289,7 +3051,18 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
  
  def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
      spec_config = vllm_config.speculative_config
-@@ -1159,6 +1179,27 @@
+@@ -1126,6 +1146,10 @@
+         intermediate_tensors = None
+         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++        _dsv41_trace = os.environ.get("DSV41_DEBUG_TRACE") == "1" and forward_pass
++        if _dsv41_trace:
++            self._dsv41_tr_step = getattr(self, "_dsv41_tr_step", 0) + 1
++            _dsv41_tr = {"in": time.perf_counter()}
+         all_gather_tensors = {}
+         compilation_config = self.vllm_config.compilation_config
+         parallel_config = self.vllm_config.parallel_config
+@@ -1159,6 +1183,27 @@
                  )
              }
  
@@ -2317,9 +3090,12 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
          if forward_pass and not get_pp_group().is_first_rank:
              tensor_dict, comm_handles, comm_postprocess = (
                  get_pp_group().irecv_tensor_dict(
-@@ -1173,20 +1214,57 @@
+@@ -1172,21 +1217,90 @@
+                 comm_handles=comm_handles,
                  comm_postprocess=comm_postprocess,
              )
++        if _dsv41_trace:
++            _dsv41_tr["recv_posted"] = time.perf_counter()
  
 +        if _dsv41_sync:
 +            try:
@@ -2349,6 +3125,25 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
 -                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
 -            ):
 -                return output
++        if _dsv41_trace:
++            _dsv41_tr["launched"] = time.perf_counter()
++            _dsv41_ev = torch.cuda.Event()
++            _dsv41_ev.record()
++            _dsv41_step = self._dsv41_tr_step
++            _dsv41_rank = get_pp_group().rank_in_group
++
++            def _dsv41_tr_emit(tr=_dsv41_tr, ev=_dsv41_ev, step=_dsv41_step, rank=_dsv41_rank,
++                               T=num_scheduled_tokens):
++                if not (40 <= step <= 44):
++                    return
++                import threading
++
++                def _w():
++                    ev.synchronize()
++                    tr["gpu_done"] = time.perf_counter()
++                    logger.info("DSV41 TRACE rank %d step %d T=%d %s", rank, step, T,
++                                " ".join(f"{k}={v:.4f}" for k, v in tr.items()))
++                threading.Thread(target=_w, daemon=True).start()
 +        if _dsv41_prof is not None:
 +            torch.cuda.synchronize()
 +            _dsv41_prof.__exit__(None, None, None)
@@ -2358,20 +3153,28 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
 +                tot = sum(getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)) for e in ka
 +                          if not getattr(e, "is_async", False))
 +                lines = [f"DSV41 PROFILE rank {get_pp_group().rank_in_group} T=1 step: kernels by device time (us); "
-+                         f"self-cpu total {sum(e.self_cpu_time_total for e in ka):.0f} us"]
++                         f"self-cpu total {sum(e.self_cpu_time_total for e in ka):.0f} us; device total {tot:.0f} us"]
 +                for e in rows[:40]:
 +                    dt = getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0))
 +                    if dt <= 0:
 +                        continue
 +                    lines.append(f"  {dt:9.0f} us  n={e.count:4d}  {e.key[:110]}")
++                lines.append("  -- by self CPU time (us) --")
++                for e in sorted(ka, key=lambda e: -e.self_cpu_time_total)[:30]:
++                    lines.append(f"  {e.self_cpu_time_total:9.0f} us  n={e.count:4d}  {e.key[:110]}")
 +                logger.info("\n".join(lines))
 +        if _dsv41_sync:
 +            torch.cuda.synchronize()
 +            _dsv41_t2 = time.perf_counter()
-+            self._dsv41_steps = getattr(self, "_dsv41_steps", 0) + 1
-+            if scheduler_output.total_num_scheduled_tokens == 1 and self._dsv41_steps % 16 == 0:
-+                logger.info("DSV41 STEP T=1 recv-wait %.2f ms forward %.2f ms",
-+                            (_dsv41_t1 - _dsv41_t0) * 1e3, (_dsv41_t2 - _dsv41_t1) * 1e3)
++            _T = scheduler_output.total_num_scheduled_tokens
++            if _T == 0:
++                self._dsv41_empty = getattr(self, "_dsv41_empty", 0) + 1
++            elif _T == 1:
++                self._dsv41_steps = getattr(self, "_dsv41_steps", 0) + 1
++                if self._dsv41_steps % 16 == 0:
++                    logger.info("DSV41 STEP T=1 recv-wait %.2f ms forward %.2f ms (empty calls so far %d, T=1 steps %d)",
++                                (_dsv41_t1 - _dsv41_t0) * 1e3, (_dsv41_t2 - _dsv41_t1) * 1e3,
++                                getattr(self, "_dsv41_empty", 0), self._dsv41_steps)
 +        if (
 +            self.use_v2_model_runner
 +            and self.model_runner.is_pooling_model
@@ -2381,10 +3184,23 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
 +        if isinstance(
 +            output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
 +        ):
++            if _dsv41_trace:
++                _dsv41_tr["out"] = time.perf_counter()
++                _dsv41_tr_emit()
 +            return output
  
          assert isinstance(output, IntermediateTensors)
          parallel_config = self.vllm_config.parallel_config
+@@ -1204,6 +1318,9 @@
+             all_gather_tensors=all_gather_tensors,
+         )
+         self._pp_send_work = handles[1:]
++        if _dsv41_trace:
++            _dsv41_tr["sent"] = time.perf_counter()
++            _dsv41_tr_emit()
+ 
+         return None
+ 
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/worker/utils.py vllm/v1/worker/utils.py
 --- image-official/v1/worker/utils.py	2026-09-09 23:38:04.000000000 -0700
 +++ vllm/v1/worker/utils.py	2026-09-10 20:30:12.986768265 -0700
