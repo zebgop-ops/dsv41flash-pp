@@ -5,7 +5,7 @@ Both metrics are prefill-only and deterministic, so a run is reproducible and th
 checkpoints see byte-identical inputs (same tokenizer -> same token sequences).
 
   ppl  <url> <textfile> [max_tokens_total] [window_chars]
-       Perplexity from the server's `prompt_logprobs`: sum log P(token | prefix) over a
+       Perplexity and bits-per-byte from the server's `prompt_logprobs`: sum log P(token | prefix) over a
        fixed set of windows. Windows are cut by character offset, so they are identical
        across models; the per-window token counts are printed and must match.
 
@@ -53,8 +53,12 @@ def perplexity(url, path, budget=65536, window_chars=8192):
                   f"ppl so far {math.exp(-total_lp/total_tok):8.4f}  ({time.time()-t0:5.0f} s)",
                   flush=True)
     ppl = math.exp(-total_lp / total_tok)
+    # bits per byte is tokenizer-independent, so it compares across model families
+    total_bytes = sum(len(text[o:o + n].encode()) for o, n in windows)
+    bpb = (-total_lp / math.log(2)) / total_bytes
     print(json.dumps({"metric": "perplexity", "file": os.path.basename(path), "model": MODEL,
                       "tokens": total_tok, "windows": len(windows), "nll": -total_lp / total_tok,
+                      "bytes": total_bytes, "bits_per_byte": bpb,
                       "ppl": ppl, "per_window_tokens": [w[0] for w in per_window],
                       "per_window_nll": [-w[1] / w[0] for w in per_window]}))
     return ppl
