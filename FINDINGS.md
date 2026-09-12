@@ -261,6 +261,13 @@ cache is bind-mounted at `/hf` inside the container; `link-reap-engram.sh`). Exp
   speculative verify rows are cheap again, so DSpark (default here, on a 10,10,11,9 partition so
   its draft fits next to 9 layers on rank 3) reaches ~35 tok/s on prose and ~100 tok/s decode on
   code, and n-gram ~66 tok/s on copy-heavy code. Numbers in RESULTS.md.
+- **Prefill.** With a drafter on, the engine core blocks in `take_draft_token_ids` after every
+  batch, so a long prompt's 2048-token chunks went through the four ranks strictly one at a
+  time: 1.4k tok/s, flat from 6k to 21k tokens, ~1.47 s per chunk = the sum of the four ranks.
+  The overlay's `core.py` now skips that RPC for batches that do not complete a prompt
+  (`DSV41_DRAFT_SKIP_PREFILL=1`), which lets the batch queue keep up to four chunks in flight:
+  2.4k tok/s at 6k and 3.1k tok/s at 14k tokens, outputs unchanged. What remains is the per-rank
+  chunk compute (~650 ms per 2048 tokens on the slowest rank) and the queue depth.
 
 ## Diagnostic switches (all off by default)
 

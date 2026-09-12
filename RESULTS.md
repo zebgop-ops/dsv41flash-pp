@@ -113,7 +113,8 @@ either way. Numbers from a fresh boot after one warm-up request per prompt shape
 | fresh code (LRU cache + tests), 300 tokens streaming | 15.3 s (DSpark) | ~11 s | 3.4 s (63 steps, 4.7 tokens/step) |
 | specbench prose / code-edit (thinking on, incl. prefill) | 13.6 / 14.8 tok/s | 28.3 / 43.3 tok/s | 29-34 / 51-94 tok/s |
 | prefill, 525-token prompt | ~60 tok/s | ~500 tok/s | ~500 tok/s |
-| prefill, 29k-token prompt (needle, recall OK) | ~106 tok/s | 316 tok/s | 316 tok/s |
+| prefill, 6k / 14k-token prompts (chunks pipelined, FINDINGS §9) | ~100 tok/s | – | 2.4k / 3.1k tok/s |
+| prefill, 29k-token prompt (needle, recall OK; before the pipelining fix) | ~106 tok/s | 316 tok/s | 316 tok/s |
 | KV pool at 131k max-model-len | 904k tokens | 4.7M tokens | 1.4M tokens |
 | greedy code-edit output vs the base model | – | identical | identical |
 

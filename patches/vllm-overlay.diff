@@ -2684,7 +2684,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/cuda
          if CUDAGraphMode.FULL in allowed_modes:
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engine/core.py vllm/v1/engine/core.py
 --- image-official/v1/engine/core.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/v1/engine/core.py	2026-09-11 12:36:04.827939280 -0700
++++ vllm/v1/engine/core.py	2026-09-11 22:31:38.898830283 -0700
 @@ -96,6 +96,24 @@
  
  logger = init_logger(__name__)
@@ -2710,10 +2710,17 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
  
  HANDSHAKE_TIMEOUT_MINS = 5
  
-@@ -642,7 +660,10 @@
+@@ -641,8 +659,16 @@
+         # When using async scheduling we can't get draft token ids in advance,
          # so we update draft token ids in the worker process and don't
          # need to update draft token ids here.
-         if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
+-        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
++        if (
++            self.check_for_draft_tokens
++            and not self.async_scheduling
++            and model_executed
++            and getattr(self, "_dsv41_needs_draft", True)  # dsv41 prefill-chunk
++        ):
 +            _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
              draft_token_ids = self.model_executor.take_draft_token_ids()
 +            if _DSV41_CORE:
@@ -2721,7 +2728,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
              if draft_token_ids is not None:
                  self.scheduler.update_draft_token_ids(draft_token_ids)
  
-@@ -674,11 +695,23 @@
+@@ -674,11 +700,34 @@
          model_executed = False
          deferred_scheduler_output = None
          if self.scheduler.has_requests():
@@ -2742,10 +2749,21 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
                  )
 +            if _DSV41_CORE:
 +                _dsv41_acc("exec_rpc" if scheduler_output.total_num_scheduled_tokens else "exec_rpc_empty", _dsv41_time.perf_counter() - _dsv41_t)
++            # dsv41 prefill-chunk: drafts only matter once a request has its whole prompt; for
++            # batches made of intermediate prefill chunks, skip the blocking draft RPC in
++            # post_step so the next chunk can be scheduled and the pipeline fills
++            if _dsv41_os.environ.get("DSV41_DRAFT_SKIP_PREFILL", "1") == "1":
++                needs = False
++                for _rid in scheduler_output.num_scheduled_tokens:
++                    _req = self.scheduler.requests.get(_rid)
++                    if _req is None or _req.num_computed_tokens >= _req.num_prompt_tokens:
++                        needs = True
++                        break
++                self._dsv41_needs_draft = needs
              if self.is_ec_consumer:
                  model_executed = scheduler_output.total_num_scheduled_tokens > 0
  
-@@ -692,9 +725,12 @@
+@@ -692,9 +741,12 @@
                      grammar_output = self.scheduler.get_grammar_bitmask(
                          scheduler_output
                      )
@@ -2758,7 +2776,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
                  else:
                      # We need to defer sampling until we have processed the model output
                      # from the prior step.
-@@ -718,6 +754,7 @@
+@@ -718,6 +770,7 @@
  
          # Block until the next result is available.
          future, scheduler_output, exec_model_fut = batch_queue.pop()
@@ -2766,7 +2784,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
          with (
              self.capture_iteration_details(scheduler_output) as iteration_details,
              self.log_error_detail(scheduler_output),
-@@ -728,6 +765,10 @@
+@@ -728,6 +781,10 @@
                  # call failed - raise that exception.
                  exec_model_fut.result()
                  raise RuntimeError("unexpected error")
@@ -2777,7 +2795,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
  
          # Before processing the model output, process any aborts that happened
          # during the model execution.
-@@ -736,6 +777,10 @@
+@@ -736,6 +793,10 @@
              scheduler_output, model_output
          )
          self._attach_iteration_details(engine_core_outputs, iteration_details)

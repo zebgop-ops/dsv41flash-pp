@@ -324,3 +324,9 @@ exact rows, 4.2 M rows/s warm.
   tok/s, code-edit 51-94 tok/s incl. prefill; streaming prose 10.3-12.0 s / 400 tok, code-edit 4.3 s (72
   steps), fresh code 3.4 s / 300 tok; needle 30k RECALL OK; code-edit output identical to the base model.
   KV pool 1.42M tokens. dsv41reap-pp left running on :8005 (dsv41-pp stopped; only one can run).
+- 2026-09-12 05:50 PT — PREFILL bottleneck: with a drafter on, the engine blocked in take_draft_token_ids after
+  every batch, so prefill chunks went through the 4 ranks one at a time (1.4k tok/s flat from 6k to 21k tokens,
+  ~1.47 s per 2048-token chunk = sum of the four ranks). core.py now skips the draft RPC for batches that do
+  not complete a prompt (DSV41_DRAFT_SKIP_PREFILL=1): 2.4k tok/s at 5.9k, 3.1k tok/s at 14k tokens; decode
+  and outputs unchanged (code-edit identical, 98% accepted). Remaining ceiling: per-rank chunk compute
+  (~650 ms per 2048 tokens on the slowest rank) and the batch-queue depth of 4.
