@@ -137,8 +137,9 @@ that produced it.
 10. **REAP-272E, all experts on the GPUs** (FINDINGS.md §9, `serve/run-dsv41reap-pp4.sh`).
    The pruned checkpoint (272 of 384 experts, +4% perplexity) fits a 10,10,10,10 partition
    once the PP shadow plan is allowed to cut inside an index group (it replays the index
-   source's top-k on the later rank) and the router admits 272 experts. No CPU experts, DSpark
-   on: ~35 tok/s prose, ~100 tok/s decode on code, ~500 tok/s prefill (316 at 29k tokens).
+   source's top-k on the later rank) and the router admits 272 experts. No CPU experts: ~30 tok/s
+   prose, 45-66 tok/s on code, ~3k tok/s prefill, 512k context. Now its own repo:
+   [dsv41reap-pp](https://github.com/zebgop-ops/dsv41reap-pp).
 
 ## Layout
 

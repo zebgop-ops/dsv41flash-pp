@@ -1,9 +1,9 @@
 """Sustained agentic-style soak at concurrency 8, with a validated detector."""
-import json, time, urllib.request, concurrent.futures as cf, uuid, sys
+import json, time, urllib.request, concurrent.futures as cf, uuid, sys, os
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from detect import find_loop
 
-URL = "http://localhost:8004/v1/chat/completions"
+URL = os.environ.get("DSV41_URL", "http://localhost:8004") + "/v1/chat/completions"
 CODE = """
 sh.fragmentShader = sh.fragmentShader.replace('#include <map_fragment>', `
   #include <map_fragment>
@@ -29,7 +29,7 @@ TASKS = [
 def one(i):
     q = f"[{uuid.uuid4()}] Project source:\n{CODE}\n\nTask: {TASKS[i % len(TASKS)]}"
     body = json.dumps({
-        "model": "DSv41Flash", "messages": [{"role": "user", "content": q}],
+        "model": os.environ.get("DSV41_MODEL", "DSv41Flash"), "messages": [{"role": "user", "content": q}],
         "max_tokens": 1500, "temperature": 1.0, "top_p": 0.95, "chat_template_kwargs": {"reasoning_effort": "low"},
     }).encode()
     r = urllib.request.Request(URL, data=body,

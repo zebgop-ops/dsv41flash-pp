@@ -330,3 +330,10 @@ exact rows, 4.2 M rows/s warm.
   not complete a prompt (DSV41_DRAFT_SKIP_PREFILL=1): 2.4k tok/s at 5.9k, 3.1k tok/s at 14k tokens; decode
   and outputs unchanged (code-edit identical, 98% accepted). Remaining ceiling: per-rank chunk compute
   (~650 ms per 2048 tokens on the slowest rank) and the batch-queue depth of 4.
+- 2026-09-12 07:20 PT — REAP FINAL (all layers on the GPUs, per the user): n-gram K=3, partition 10,10,10,10,
+  CPU layers none, util 0.93 (rank 3 59.1 GiB used; 61-63 GiB has crashed here), max-model-len 524288 (KV pool
+  2.22M tokens = 4.2 x 512k; 3.72M at 0.95). Needle 30k/200k RECALL OK, code-edit identical, prose streaming
+  14.2 s / 400 tok, prefill 2.9k tok/s at 10k. DSpark needs 8.4 GiB on rank 3 -> only with 38-39 on the CPU
+  (256k) or with an 11-layer rank at 131k; both rejected (CPU layers / margins). 1M max-model-len: the
+  profiling transient plus an 11-layer rank or the draft leaves no KV memory. Standalone repo
+  /home/r/dsv41reap-pp -> github.com/zebgop-ops/dsv41reap-pp. Soak 600 s x4 running.

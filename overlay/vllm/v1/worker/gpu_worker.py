@@ -1247,7 +1247,10 @@ class Worker(WorkerBase):
 
             def _dsv41_tr_emit(tr=_dsv41_tr, ev=_dsv41_ev, step=_dsv41_step, rank=_dsv41_rank,
                                T=num_scheduled_tokens):
-                if not (40 <= step <= 44):
+                if not (
+                    40 <= step <= 44
+                    or (T > 1 and step <= 60 and os.environ.get("DSV41_DEBUG_TRACE_PREFILL") == "1")
+                ):
                     return
                 import threading
 

@@ -708,7 +708,11 @@ class EngineCore:
                 _dsv41_t = _dsv41_t2
             if _dsv41_os.environ.get("DSV41_DEBUG_TRACE") == "1" and scheduler_output.total_num_scheduled_tokens:
                 self._dsv41_tr_step = getattr(self, "_dsv41_tr_step", 0) + 1
-                if 40 <= self._dsv41_tr_step <= 44:
+                if 40 <= self._dsv41_tr_step <= 44 or (
+                    scheduler_output.total_num_scheduled_tokens > 1
+                    and self._dsv41_tr_step <= 60
+                    and _dsv41_os.environ.get("DSV41_DEBUG_TRACE_PREFILL") == "1"
+                ):
                     logger.info("DSV41 TRACE core step %d T=%d exec_issue=%.4f", self._dsv41_tr_step,
                                 scheduler_output.total_num_scheduled_tokens, _dsv41_time.perf_counter())
             with self.log_error_detail(scheduler_output):
