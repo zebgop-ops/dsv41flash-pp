@@ -8,3 +8,4 @@ dump/*
 overlay/image-official/
 kt/site/
 kt/wheel/
+eval/*

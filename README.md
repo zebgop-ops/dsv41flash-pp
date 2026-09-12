@@ -139,7 +139,9 @@ that produced it.
    once the PP shadow plan is allowed to cut inside an index group (it replays the index
    source's top-k on the later rank) and the router admits 272 experts. No CPU experts: ~30 tok/s
    prose, 45-66 tok/s on code, ~3k tok/s prefill, 512k context. Now its own repo:
-   [dsv41reap-pp](https://github.com/zebgop-ops/dsv41reap-pp).
+   [dsv41reap-pp](https://github.com/zebgop-ops/dsv41reap-pp). Measured cost of the pruning,
+   both checkpoints on this stack: wikitext-2 perplexity +28.3% and MMLU 84.4% -> 76.7% over the
+   same 1000 questions, while code perplexity and greedy code output are unchanged.
 
 ## Layout
 

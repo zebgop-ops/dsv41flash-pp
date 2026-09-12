@@ -337,3 +337,13 @@ exact rows, 4.2 M rows/s warm.
   (256k) or with an 11-layer rank at 131k; both rejected (CPU layers / margins). 1M max-model-len: the
   profiling transient plus an 11-layer rank or the draft leaves no KV memory. Standalone repo
   /home/r/dsv41reap-pp -> github.com/zebgop-ops/dsv41reap-pp. Soak 600 s x4 running.
+- 2026-09-12 19:10 PT — MEASURED the REAP pruning loss (both checkpoints on this stack, identical
+  inputs; tools/quality.py + qcompare.py, datasets per eval/README.md). wikitext-2 (67,131 tok):
+  2.7147 -> 3.4821 = +28.3% ppl (paired per-window +0.2495 +-0.0419 nats). Python stdlib code
+  (30,589 tok): 1.3633 -> 1.3642 = +0.06% (CI includes 0). MMLU 1000 identical questions: 84.4% ->
+  76.7% (-7.7 pts; 730 both right, 114 base-only, 37 reap-only, McNemar p<1e-4; same letter 81.7%),
+  margin 3.40 -> 2.14 nats. Worst subjects: hs chemistry -33, professional law -21.5, prehistory -21.
+  The card claims +4.1% text ppl. Port exonerated: ktests/test_reap_router.py (Triton dsv4_topk vs
+  the checkpoint's reference Gate for 128/160/256/272/384 experts, 16/16 pass, weights within 1e-5),
+  code ppl unchanged, code-edit output byte-identical. Conclusion: near-free for coding, a real
+  knowledge hit otherwise -> keep the unpruned DSv41 available for knowledge work.
