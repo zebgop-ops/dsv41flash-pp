@@ -45,6 +45,7 @@ FILES=(
   config/engram.py
   config/vllm.py
   config/speculative.py
+  model_executor/layers/fused_moe/router/dsv4_topk.py
   config/attention.py
   engine/arg_utils.py
   platforms/cuda.py

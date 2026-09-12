@@ -100,6 +100,28 @@ layers 33-39 on the CPU (two more than the other rows) and confidence truncation
 Without truncation (`DSV41_DSPARK_CONF=0`) every step verifies 6 rows at ~265 ms: prose falls to
 8.3 tok/s. The cost is the CPU-expert layers (~20 ms each per 6-row step, FINDINGS.md §8).
 
+### REAP-272E, every expert on the GPUs (`serve/run-dsv41reap-pp4.sh`, :8005)
+
+Same prompts as above, streaming with thinking off unless noted. The default is DSpark on a
+10,10,11,9 partition (the draft sits on the 9-layer rank); n-gram uses 10,10,10,10. No CPU experts
+either way. Numbers from a fresh boot after one warm-up request per prompt shape.
+
+| workload | base model, n-gram (9 CPU layers) | REAP, n-gram K=3 | REAP, DSpark (default) |
+|---|---|---|---|
+| free prose, 400 tokens streaming | 26-28 s (14 tok/s) | 12.7-14.2 s (28-31 tok/s) | 10.3-12.0 s (33-39 tok/s) |
+| code edit, 529-token prompt, 400 tokens streaming | 23.5 s | 6.0 s | 4.3 s (72 steps, ~110 tok/s decode) |
+| fresh code (LRU cache + tests), 300 tokens streaming | 15.3 s (DSpark) | ~11 s | 3.4 s (63 steps, 4.7 tokens/step) |
+| specbench prose / code-edit (thinking on, incl. prefill) | 13.6 / 14.8 tok/s | 28.3 / 43.3 tok/s | 29-34 / 51-94 tok/s |
+| prefill, 525-token prompt | ~60 tok/s | ~500 tok/s | ~500 tok/s |
+| prefill, 29k-token prompt (needle, recall OK) | ~106 tok/s | 316 tok/s | 316 tok/s |
+| KV pool at 131k max-model-len | 904k tokens | 4.7M tokens | 1.4M tokens |
+| greedy code-edit output vs the base model | – | identical | identical |
+
+Pruning cost per the model card: +4.1% text perplexity. On the three logprob probes the pruned
+model produces the same texts with flatter distributions (up to 2.5-4.3 nats on the top token).
+The 10,10,10,10 layout was checked against 8,12,8,12 (identical code-edit output, prose diverging
+at char 429, i.e. the stack's usual kernel numerics) and with the 30k needle test.
+
 ## Memory
 
 | rank | layers | GPU weights + non-torch | KV pool |

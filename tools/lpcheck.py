@@ -1,12 +1,12 @@
 """Top-5 logprobs at the first 3 generated positions for a fixed prompt set; save/compare.
 usage: lpcheck.py <save.json> [compare.json] [url]"""
-import json, sys, urllib.request
+import os, json, sys, urllib.request
 SAVE = sys.argv[1]; CMP = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "-" else None
 URL = sys.argv[3] if len(sys.argv) > 3 else "http://localhost:8004"
 PROMPTS = ["The capital of France is", "Q: What is the capital of France?\nA:", "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n"]
 out = {}
 for p in PROMPTS:
-    body = {"model": "DSv41Flash", "prompt": p, "max_tokens": 3, "temperature": 0.0, "logprobs": 5}
+    body = {"model": os.environ.get("DSV41_MODEL", "DSv41Flash"), "prompt": p, "max_tokens": 3, "temperature": 0.0, "logprobs": 5}
     r = json.load(urllib.request.urlopen(urllib.request.Request(URL + "/v1/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}), timeout=600))
     c = r["choices"][0]
     out[p] = {"text": c["text"], "top": [{k: round(v, 3) for k, v in lp.items()} for lp in c["logprobs"]["top_logprobs"]]}

@@ -297,3 +297,30 @@ exact rows, 4.2 M rows/s warm.
   to CPU to free a target layer nets zero. Production rebooted on n-gram defaults and re-verified (lpcheck 0.000,
   code-edit identical, 14.8 tok/s incl. prefill; capture sizes now 1,2,3,4,6,8,12,16 with q=1..3 FULL families).
   Repo updated (dspark_proposer.py, patch_dspark_v1, patch_full_qall, FINDINGS §8, RESULTS DSpark table).
+- 2026-09-12 00:40 PT — REAP-272E (LibertAIDAI/DeepSeek-V4.1-Flash-REAP-272E): 272 of 384 routed experts kept
+  per layer (+4.1% text ppl per card), no Engram shards in the repo (base shards 47/48 linked in by
+  link-reap-engram.sh), 207.6 GiB download in progress (dl-reap.log). Experts 4.76 GiB/layer -> a 10,10,10,10
+  partition fits every expert on the GPUs (~52 GiB/rank). Cuts at 10 and 30 sit inside index groups; the PP
+  shadow plan covers them by replaying the index source with top-k (rank 1 shadows 8; rank 3 shadows 20 + 28
+  with top-k) — first real use of an in-group cut, so outputs get compared against an 8,12,8,12 boot.
+  Launcher generalized (DSV41_HF_REPO), wrapper run-dsv41reap-pp4.sh (container dsv41reap-pp, :8005,
+  DSv41ReapFlash, CPU layers none; 38-39 under dspark), servers-top/web entries DSv41R added.
+- 2026-09-12 04:50 PT — REAP-272E UP on 10,10,10,10 with every expert on the GPUs (dsv41reap-pp :8005,
+  DSv41ReapFlash). Two fixes: Engram shard links must be relative (the cache is /hf inside the container);
+  vLLM's Triton DSv4 top-k router only admitted 256/384 experts and fell back to a CUDA kernel with a fixed
+  expert table ("Unsupported expert number: 272") -> patch_reap_router.py admits any count (the Triton kernel
+  pads to a power of two and masks). KV pool 4.68M tokens (was 904k). n-gram K=3 defaults: prose 28.3 tok/s
+  incl. prefill (37 ms/step streaming), code-edit 43.3 tok/s incl. a 525-token prefill (~1 s; ~500 tok/s
+  prefill), streaming code 129 steps in 6.0 s (~66 tok/s decode); code-edit greedy output identical to the
+  base model's. lpcheck vs base eager: same texts, distributions flatter (up to 2.5-4.3 nats on 'Paris'/code
+  probes) = the pruning. Validating the in-group cuts (index-source shadows 8 / 20+28) against 8,12,8,12 next.
+- 2026-09-12 05:10 PT — 10,10,10,10 validated vs 8,12,8,12 (same probe texts, code-edit identical, prose
+  diverges at char 429 = numerics); needle 30k RECALL OK with the index-source shadows, prefill 316 tok/s at
+  29k. DSpark on REAP (CPU layers 38-39): prose 27.2 tok/s (n-gram 28.3), code-edit 48.2 (43.3), streaming
+  code 8.4 s vs 6.0 s (2 CPU layers x ~20 ms per 6-row step), FRESH code 300 tokens in 5.7 s (53 tok/s,
+  ~2x n-gram). Trying DSpark with a single CPU layer (39).
+- 2026-09-12 05:30 PT — REAP FINAL: DSpark default on 10,10,11,9 with NO CPU experts (rank 3 = 9 layers + the
+  8.4 GiB draft; cut 31 covered by the 28 index-source shadow). Fresh-boot verification: specbench prose 29-34
+  tok/s, code-edit 51-94 tok/s incl. prefill; streaming prose 10.3-12.0 s / 400 tok, code-edit 4.3 s (72
+  steps), fresh code 3.4 s / 300 tok; needle 30k RECALL OK; code-edit output identical to the base model.
+  KV pool 1.42M tokens. dsv41reap-pp left running on :8005 (dsv41-pp stopped; only one can run).

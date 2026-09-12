@@ -75,6 +75,18 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_e
      use_default_config = tile_n == 12 and n_thr == 512
      if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
          hc_prenorm_gemm_block_m_tilelang(
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/layers/fused_moe/router/dsv4_topk.py vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
+--- image-official/model_executor/layers/fused_moe/router/dsv4_topk.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/model_executor/layers/fused_moe/router/dsv4_topk.py	2026-09-11 21:38:22.298514139 -0700
+@@ -23,7 +23,7 @@
+         current_platform.is_cuda()
+         and gating_output.dtype == torch.float32
+         and gating_output.ndim == 2
+-        and gating_output.shape[1] in (256, 384)
++        and 1 < gating_output.shape[1] <= 1024  # dsv41 reap: any count (kernel pads to pow2)
+         and gating_output.is_contiguous()
+         and correction_bias is not None
+         and correction_bias.dtype == torch.float32
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/layers/quantization/mxfp4.py vllm/model_executor/layers/quantization/mxfp4.py
 --- image-official/model_executor/layers/quantization/mxfp4.py	2026-09-09 23:38:04.000000000 -0700
 +++ vllm/model_executor/layers/quantization/mxfp4.py	2026-09-11 01:26:51.474956808 -0700

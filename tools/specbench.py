@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Decode-rate + spec-decode acceptance on two workloads: free prose and a context-heavy
 code edit (where n-gram/prompt-lookup drafts hit). usage: specbench.py [url] [max_tokens]"""
-import json, sys, time, urllib.request
+import os, json, sys, time, urllib.request
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8004"
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 400
 SAVE = sys.argv[3] if len(sys.argv) > 3 else None        # save outputs to this json
@@ -70,10 +70,10 @@ TASKS["code-edit"] = ("Here is a Python file:\n```python\n" + CODE + "```\nThe s
 for name, prompt in TASKS.items():
     m0 = metrics()
     if name == "code-edit":  # raw completion: the model continues straight into code (no reasoning)
-        body = {"model": "DSv41Flash", "prompt": prompt, "max_tokens": N, "temperature": 0.0}
+        body = {"model": os.environ.get("DSV41_MODEL", "DSv41Flash"), "prompt": prompt, "max_tokens": N, "temperature": 0.0}
         req = urllib.request.Request(URL + "/v1/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     else:
-        body = {"model": "DSv41Flash", "messages": [{"role": "user", "content": prompt}], "max_tokens": N, "temperature": 0.0}
+        body = {"model": os.environ.get("DSV41_MODEL", "DSv41Flash"), "messages": [{"role": "user", "content": prompt}], "max_tokens": N, "temperature": 0.0}
         req = urllib.request.Request(URL + "/v1/chat/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     t0 = time.time(); r = json.load(urllib.request.urlopen(req, timeout=1800)); dt = time.time() - t0
     m1 = metrics(); u = r["usage"]

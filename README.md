@@ -58,8 +58,9 @@ physical core), `DSV41_ENGRAM_STORAGE` (`ssd`), `DSV41_MAXLEN` (131072), `DSV41_
 `DSV41_NGRAM_MIN` 5 / `DSV41_NGRAM_MAX` 8; `DSV41_SPEC_METHOD=dspark` for the checkpoint's own
 drafter, FINDINGS.md §8), `DSV41_CG` (`FULL_DECODE_ONLY` without speculation,
 `FULL_AND_PIECEWISE` with it; `NONE` for diagnostics), `DSV41_GPUS`, `DSV41_EXTRA_ARGS`,
-`DSV41_EXTRA_DOCKER` (e.g. `"-e CUDA_LAUNCH_BLOCKING=1"`), and the diagnostic switches in
-[FINDINGS.md](FINDINGS.md). It pre-flights the checkpoint, the
+`DSV41_EXTRA_DOCKER` (e.g. `"-e CUDA_LAUNCH_BLOCKING=1"`), `DSV41_HF_REPO` (another checkpoint
+in the same cache; `serve/run-dsv41reap-pp4.sh` wraps it for the REAP-272E model on :8005), and
+the diagnostic switches in [FINDINGS.md](FINDINGS.md). It pre-flights the checkpoint, the
 driver (kernel module vs userland mismatch after an upgrade), other servers on the cards,
 and CUDA init on every GPU before touching anything.
 
@@ -133,11 +134,17 @@ that produced it.
    confidence-truncated drafts. It works and accepts 85% of drafts on fresh code (+20%), but a
    6-row verify step streams ~40 experts per CPU layer from host RAM, so prose loses; n-gram
    stays the default.
+10. **REAP-272E, all experts on the GPUs** (FINDINGS.md §9, `serve/run-dsv41reap-pp4.sh`).
+   The pruned checkpoint (272 of 384 experts, +4% perplexity) fits a 10,10,10,10 partition
+   once the PP shadow plan is allowed to cut inside an index group (it replays the index
+   source's top-k on the later rank) and the router admits 272 experts. No CPU experts, DSpark
+   on: ~35 tok/s prose, ~100 tok/s decode on code, ~500 tok/s prefill (316 at 29k tokens).
 
 ## Layout
 
 ```
-serve/run-dsv41-pp4.sh   production launcher (preflight, mounts, all flags)
+serve/run-dsv41-pp4.sh   production launcher (preflight, mounts, all flags); run-dsv41reap-pp4.sh wraps it for
+                         the REAP-272E checkpoint (link-reap-engram.sh links the base Engram shards in)
 overlay/vllm/            the Python overlay, mounted over the image's vllm package
 overlay/patch_*.py       anchor-based, idempotent patch scripts; apply-overlay.sh runs them all
                          (spec decode under PP: patch_v1_spec_pp, patch_pp_spec_tokens, patch_engram_piecewise,

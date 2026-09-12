@@ -91,7 +91,7 @@ def cpu_expert_layers() -> set[int]:
     out: set[int] = set()
     for part in spec.split(","):
         part = part.strip()
-        if not part:
+        if not part or part.lower() == "none":  # "none": every expert stays on the GPUs
             continue
         if "-" in part:
             a, b = part.split("-")

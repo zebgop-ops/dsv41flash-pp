@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Needle-in-haystack recall at a target token depth against DSv41Flash (stdlib only).
 usage: needle.py [tokens=30000] [url]"""
+import os
 import json, sys, time, random, urllib.request
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 30000
 URL = sys.argv[2] if len(sys.argv) > 2 else "http://localhost:8004"
@@ -12,7 +13,7 @@ pos = int(len(fill) * 0.55)
 fill.insert(pos, f"IMPORTANT: the maintenance access code for bay seven is {code}. Remember it.")
 doc = " ".join(fill)
 q = "What is the maintenance access code for bay seven? Reply with only the code."
-body = {"model": "DSv41Flash", "max_tokens": 200, "temperature": 0.0,
+body = {"model": os.environ.get("DSV41_MODEL", "DSv41Flash"), "max_tokens": 200, "temperature": 0.0,
         "chat_template_kwargs": {"reasoning_effort": "low"},
         "messages": [{"role": "user", "content": doc + "\n\n" + q}]}
 req = urllib.request.Request(URL + "/v1/chat/completions", data=json.dumps(body).encode(),

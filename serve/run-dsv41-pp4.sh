@@ -15,8 +15,10 @@ SERVED=${DSV41_SERVED:-DSv41Flash}
 IMG=${DSV41_IMG:-vllm/vllm-openai:deepseekv41-flash-0909}
 HFCACHE=${DSV41_HF:-/home/r/.cache/huggingface}
 RUNDIR=/home/r/dsv41-run
-SNAPSHOT=${DSV41_SNAPSHOT:-$(ls "$HFCACHE/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots" 2>/dev/null | head -1)}
-MODEL="/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/$SNAPSHOT"
+HF_REPO=${DSV41_HF_REPO:-deepseek-ai/DeepSeek-V4.1-Flash}   # e.g. LibertAIDAI/DeepSeek-V4.1-Flash-REAP-272E (see run-dsv41reap-pp4.sh)
+REPO_DIR="$HFCACHE/hub/models--${HF_REPO//\//--}"
+SNAPSHOT=${DSV41_SNAPSHOT:-$(ls "$REPO_DIR/snapshots" 2>/dev/null | head -1)}
+MODEL="/hf/hub/models--${HF_REPO//\//--}/snapshots/$SNAPSHOT"
 # Layer partition (see PLAN.md "PP4 layout"): cuts must sit on kv-source (2,8,14,20) or
 # index-source (24,28,32,36) boundaries; cuts at 24+ get a shadow of kv source 20.
 PARTITION=${DSV41_PARTITION:-8,12,8,12}
@@ -49,10 +51,10 @@ PATCHDIR=${DSV41_PATCH:-$RUNDIR/overlay/vllm}
 MEM_CAP=${DSV41_MEM_CAP_FRACTION:-0.965}   # clean OOM instead of an Xid-31 wedge near the top of a card
 
 # ---------------- preflight ----------------
-if [ -z "$SNAPSHOT" ] || [ ! -f "$HFCACHE/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/$SNAPSHOT/model-00048-of-00048.safetensors" ]; then
-  echo "checkpoint not complete in $HFCACHE (snapshot='$SNAPSHOT')"; exit 1
+if [ -z "$SNAPSHOT" ] || [ ! -f "$REPO_DIR/snapshots/$SNAPSHOT/model-00048-of-00048.safetensors" ]; then
+  echo "checkpoint not complete in $REPO_DIR (snapshot='$SNAPSHOT'; the REAP repos need the base model's Engram shards 47/48 linked in)"; exit 1
 fi
-if ls "$HFCACHE/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/blobs/"*.incomplete >/dev/null 2>&1; then
+if ls "$REPO_DIR/blobs/"*.incomplete >/dev/null 2>&1; then
   echo "download still in progress (incomplete blobs present)"; exit 1
 fi
 KMOD=$(sed -n 's/.*Kernel Module *\([0-9.]*\).*/\1/p' /proc/driver/nvidia/version | head -1)
@@ -60,7 +62,7 @@ ULIB=$(dpkg-query -W -f='${Version}' libnvidia-compute-610 2>/dev/null | cut -d-
 if [ -n "$KMOD" ] && [ -n "$ULIB" ] && [ "$KMOD" != "$ULIB" ]; then
   echo "NVIDIA driver mismatch: kernel module $KMOD vs userland $ULIB -> new CUDA containers cannot start; reboot first"; exit 1
 fi
-for other in dsv4-a100 qwen38-pp qwen38u-pp glm53flash-pp glm53nvfp4-pp; do
+for other in dsv4-a100 qwen38-pp qwen38u-pp glm53flash-pp glm53nvfp4-pp dsv41-pp dsv41reap-pp; do
   if [ "$other" != "$NAME" ] && docker ps --format '{{.Names}}' | grep -qx "$other"; then
     echo "refusing to start: $other is running on the same GPUs (stop it yourself first)"; exit 1
   fi
@@ -91,7 +93,7 @@ import sys
 out=set()
 for part in sys.argv[1].split(','):
     part=part.strip()
-    if not part: continue
+    if not part or part.lower() == 'none': continue   # DSV41_CPU_EXPERT_LAYERS=none -> every expert on the GPUs
     if '-' in part:
         a,b=part.split('-'); out.update(range(int(a),int(b)+1))
     else: out.add(int(part))

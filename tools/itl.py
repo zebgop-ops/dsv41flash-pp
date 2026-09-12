@@ -4,11 +4,11 @@ emits several tokens per chunk; rate is computed from usage-free token counting 
 completion chunks' text length is unreliable, so we count SSE chunks' token ids via
 logprobs=0? Simpler: use include_usage per chunk is not available -> count chunks and
 report chunk rate plus final usage)."""
-import json, sys, time, urllib.request
+import os, json, sys, time, urllib.request
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8004"
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 400
 PROMPT = sys.argv[3] if len(sys.argv) > 3 else "Write a long, detailed essay about the history of lighthouses, their engineering, and their keepers."
-body = {"model": "DSv41Flash", "messages": [{"role": "user", "content": PROMPT}], "max_tokens": N, "temperature": 0,
+body = {"model": os.environ.get("DSV41_MODEL", "DSv41Flash"), "messages": [{"role": "user", "content": PROMPT}], "max_tokens": N, "temperature": 0,
         "stream": True, "stream_options": {"include_usage": True}, "chat_template_kwargs": {"thinking": False}}
 req = urllib.request.Request(URL + "/v1/chat/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
 t0 = time.time(); last = t0; chunks = 0; win = []; usage = None; wstart = t0

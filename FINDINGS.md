@@ -237,6 +237,31 @@ nets to zero. Acceptance on free prose is modest (position 0: 68%, then 36/20/10
 loses even with truncation; fresh code accepts 85% of drafts (5.1 tokens per step) and gains.
 Numbers in RESULTS.md.
 
+## 9. The REAP-272E checkpoint: every expert on the GPUs
+
+`LibertAIDAI/DeepSeek-V4.1-Flash-REAP-272E` keeps 272 of the 384 routed experts per layer
+(router-weighted pruning; the card reports +4.1% text perplexity), same dense weights, same
+Engram tables (not in the repo: link the base model's shards 47/48 in, *relatively*, because the
+cache is bind-mounted at `/hf` inside the container; `link-reap-engram.sh`). Experts drop from
+6.72 to 4.76 GiB per layer, which changes the memory arithmetic that shaped everything above.
+
+- **Partition.** Legal PP cuts sit on KV/index-source layers (2, 8, 14, 20, 24, 28, 32, 36) and
+  no 4-way split of those keeps every rank at 11 expert layers or fewer, so 8,12,8,12 would still
+  need four layers on the CPU. The shadow plan turns out to handle cuts *inside* an index group:
+  the later rank gets a shadow of the group's index source that replays its top-k (the helper
+  that forbids such cuts was never wired in). With 10,10,10,10 rank 1 shadows source 8 and rank 3
+  shadows 20 and 28, and all 40 layers' experts fit (~52 GiB per rank, KV pool 4.7M tokens).
+  Validated against 8,12,8,12: same probe texts, identical greedy code-edit output, prose
+  diverging at char 429 (the stack's usual kernel numerics).
+- **Router.** vLLM's Triton DSv4 top-k kernel takes any expert count (it pads to a power of two
+  and masks) but its admission check only allows 256 or 384, so 272 fell through to a CUDA
+  kernel with a fixed expert table: `Unsupported expert number: 272`, the reason the card says
+  the checkpoint "cannot run on vLLM". `patch_reap_router.py` relaxes the check.
+- **Result.** With no CPU experts the decode step is ~37 ms and prefill runs at ~500 tok/s;
+  speculative verify rows are cheap again, so DSpark (default here, on a 10,10,11,9 partition so
+  its draft fits next to 9 layers on rank 3) reaches ~35 tok/s on prose and ~100 tok/s decode on
+  code, and n-gram ~66 tok/s on copy-heavy code. Numbers in RESULTS.md.
+
 ## Diagnostic switches (all off by default)
 
 | switch | effect |
