@@ -26,7 +26,14 @@ MODEL = os.environ.get("DSV41_MODEL", "DSv41Flash")
 def post(url, path, body, timeout=3600):
     req = urllib.request.Request(url + path, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+    except urllib.error.HTTPError as e:
+        # servers started without a raised --max-logprobs reject large logprobs asks
+        if e.code == 400 and body.get("logprobs", 0) > 5:
+            return post(url, path, dict(body, logprobs=5), timeout)
+        detail = e.read()[:300].decode(errors="replace")
+        raise RuntimeError(f"HTTP {e.code} from {path}: {detail}") from None
 
 
 def perplexity(url, path, budget=65536, window_chars=8192):
