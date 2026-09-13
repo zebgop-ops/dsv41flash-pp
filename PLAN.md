@@ -347,3 +347,15 @@ exact rows, 4.2 M rows/s warm.
   the checkpoint's reference Gate for 128/160/256/272/384 experts, 16/16 pass, weights within 1e-5),
   code ppl unchanged, code-edit output byte-identical. Conclusion: near-free for coding, a real
   knowledge hit otherwise -> keep the unpruned DSv41 available for knowledge work.
+- 2026-09-13 03:40 PT — HumanEval+/MBPP+ (executed pass@1) across all four servers. Harness:
+  tools/codeeval.py (generation + last-```python extraction + DSV41_RETRY pass for anything that hit
+  the first token cap), tools/coderun.sh/.py (execution in a container with --network none, caps
+  dropped, user nobody, tmpfs, 4g/4cpu/512pid, 30 s per task), tools/coderun-all.sh (drives every
+  server), tools/qcode.py + qreport.py (tables from JSON). Sandbox validated on the datasets'
+  reference solutions: MBPP+ 378/378, HumanEval+ 163/164 (HumanEval/32's own reference fails its
+  plus tests = the ceiling). Results: Qwen3.8 155/164 + 314/378 (86.5% combined), GLM-5.3 152+315
+  (86.2%), DSv41 unpruned 154+321 (87.6%), DSv41R REAP 154+315 (86.5%). No pair separable by
+  McNemar on 542 tasks. KEY: pruned vs unpruned tie EXACTLY on HumanEval+ and differ 1.6 on MBPP+,
+  versus -7.7 on MMLU -> REAP removed knowledge, not coding. Verbosity: GLM ~200 tok/task vs
+  Qwen/REAP ~1200, no accuracy benefit. 5-9 tasks per model run past a 16k budget and count as
+  failures. Report: eval/CROSS-MODEL.md (generated), published in zebgop-ops/dsv41reap-pp.
