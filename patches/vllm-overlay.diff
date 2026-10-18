@@ -2870,8 +2870,33 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/core
  
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/core/sched/scheduler.py vllm/v1/core/sched/scheduler.py
 --- image-official/v1/core/sched/scheduler.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/v1/core/sched/scheduler.py	2026-09-11 08:44:06.448574221 -0700
-@@ -590,6 +590,17 @@
++++ vllm/v1/core/sched/scheduler.py	2026-10-17 22:29:04.862139197 -0700
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -557,6 +558,16 @@
+ 
+         # First, schedule the RUNNING requests.
+         req_index = 0
++        # dsv41 pp spread: cap decodes per micro-batch under PP without async scheduling
++        _dsv41_spread_cap = 0
++        if (
++            self.use_pp
++            and not self.scheduler_config.async_scheduling
++            and os.environ.get("DSV41_PP_SPREAD", "1") == "1"
++        ):
++            _pp = self.parallel_config.pipeline_parallel_size
++            _dsv41_spread_cap = max(1, -(-len(self.running) // _pp))
++        _dsv41_decodes = 0
+         while req_index < len(self.running) and token_budget > 0:
+             request = self.running[req_index]
+             if input_budget <= draft_slots:
+@@ -590,6 +601,22 @@
                  req_index += 1
                  continue
  
@@ -2886,10 +2911,15 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/core
 +            ):
 +                req_index += 1
 +                continue
++            if _dsv41_spread_cap and not request.is_prefill_chunk:  # dsv41 pp spread
++                if _dsv41_decodes >= _dsv41_spread_cap:
++                    req_index += 1
++                    continue
++                _dsv41_decodes += 1
              num_new_tokens = (
                  request.num_tokens_with_spec
                  + request.num_output_placeholders
-@@ -1579,9 +1590,12 @@
+@@ -1579,9 +1606,12 @@
                  num_tokens = num_scheduled_tokens[req_id] - len(
                      spec_decode_tokens.get(req_id, ())
                  )
@@ -2905,7 +2935,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/core
                  new_token_ids.append(token_ids)
              if idx >= num_running_reqs:
                  resumed_req_ids.add(req_id)
-@@ -2486,9 +2500,17 @@
+@@ -2486,9 +2516,17 @@
  
          return valid_requests
  
@@ -3019,7 +3049,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/cuda
          if CUDAGraphMode.FULL in allowed_modes:
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engine/core.py vllm/v1/engine/core.py
 --- image-official/v1/engine/core.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/v1/engine/core.py	2026-09-11 22:48:53.773280033 -0700
++++ vllm/v1/engine/core.py	2026-10-17 22:12:00.462513232 -0700
 @@ -96,6 +96,24 @@
  
  logger = init_logger(__name__)
@@ -3045,7 +3075,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
  
  HANDSHAKE_TIMEOUT_MINS = 5
  
-@@ -641,8 +659,16 @@
+@@ -641,8 +659,17 @@
          # When using async scheduling we can't get draft token ids in advance,
          # so we update draft token ids in the worker process and don't
          # need to update draft token ids here.
@@ -3055,6 +3085,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
 +            and not self.async_scheduling
 +            and model_executed
 +            and getattr(self, "_dsv41_needs_draft", True)  # dsv41 prefill-chunk
++            and not (self.batch_queue is not None and _dsv41_os.environ.get("DSV41_DEFER_DRAFT", "1") == "1")  # dsv41 defer draft
 +        ):
 +            _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
              draft_token_ids = self.model_executor.take_draft_token_ids()
@@ -3063,7 +3094,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
              if draft_token_ids is not None:
                  self.scheduler.update_draft_token_ids(draft_token_ids)
  
-@@ -674,11 +700,38 @@
+@@ -674,11 +701,38 @@
          model_executed = False
          deferred_scheduler_output = None
          if self.scheduler.has_requests():
@@ -3102,7 +3133,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
              if self.is_ec_consumer:
                  model_executed = scheduler_output.total_num_scheduled_tokens > 0
  
-@@ -692,9 +745,12 @@
+@@ -692,14 +746,27 @@
                      grammar_output = self.scheduler.get_grammar_bitmask(
                          scheduler_output
                      )
@@ -3115,15 +3146,38 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
                  else:
                      # We need to defer sampling until we have processed the model output
                      # from the prior step.
-@@ -718,6 +774,7 @@
+                     deferred_scheduler_output = scheduler_output
+ 
++            if (  # dsv41 defer draft: fetch this batch's drafts without blocking the queue
++                not deferred_scheduler_output
++                and model_executed
++                and self.check_for_draft_tokens
++                and not self.async_scheduling
++                and getattr(self, "_dsv41_needs_draft", True)
++                and _dsv41_os.environ.get("DSV41_DEFER_DRAFT", "1") == "1"
++            ):
++                self.__dict__.setdefault("_dsv41_draft_futs", {})[id(future)] = self.model_executor.collective_rpc(
++                    "take_draft_token_ids", unique_reply_rank=self.model_executor.output_rank, non_block=True)
+             if not deferred_scheduler_output:
+                 # Add this step's future to the queue.
+                 batch_queue.appendleft((future, scheduler_output, exec_future))
+@@ -717,7 +784,15 @@
+             return None, False
  
          # Block until the next result is available.
++        if _DSV41_CORE:  # dsv41: queue depth and batch size statistics
++            _st = self.__dict__.setdefault("_dsv41_qstat", [0, 0, 0, 0])
++            _st[0] += 1; _st[1] += len(batch_queue)
++            _st[2] += batch_queue[-1][1].total_num_scheduled_tokens; _st[3] += len(batch_queue[-1][1].num_scheduled_tokens)
++            if _st[0] % 64 == 0:
++                logger.info("DSV41 QUEUE over %d pops: mean depth %.2f, mean tokens/batch %.2f, mean reqs/batch %.2f",
++                            _st[0], _st[1] / _st[0], _st[2] / _st[0], _st[3] / _st[0])
          future, scheduler_output, exec_model_fut = batch_queue.pop()
 +        _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
          with (
              self.capture_iteration_details(scheduler_output) as iteration_details,
              self.log_error_detail(scheduler_output),
-@@ -728,6 +785,10 @@
+@@ -728,6 +803,10 @@
                  # call failed - raise that exception.
                  exec_model_fut.result()
                  raise RuntimeError("unexpected error")
@@ -3134,9 +3188,15 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
  
          # Before processing the model output, process any aborts that happened
          # during the model execution.
-@@ -736,6 +797,10 @@
+@@ -735,7 +814,16 @@
+         engine_core_outputs = self.scheduler.update_from_output(
              scheduler_output, model_output
          )
++        _dsv41_df = self.__dict__.get("_dsv41_draft_futs", {}).pop(id(future), None)  # dsv41 defer draft
++        if _dsv41_df is not None:
++            _dsv41_dt = _dsv41_df.result()
++            if _dsv41_dt is not None:
++                self.scheduler.update_draft_token_ids(_dsv41_dt)
          self._attach_iteration_details(engine_core_outputs, iteration_details)
 +        if _DSV41_CORE and scheduler_output.total_num_scheduled_tokens:
 +            _dsv41_acc("update_from_output", _dsv41_time.perf_counter() - _dsv41_t)
@@ -3147,7 +3207,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engi
          # in a field and do it immediately once step_with_batch_queue is
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/worker/gpu_model_runner.py vllm/v1/worker/gpu_model_runner.py
 --- image-official/v1/worker/gpu_model_runner.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/v1/worker/gpu_model_runner.py	2026-09-11 16:08:37.223696983 -0700
++++ vllm/v1/worker/gpu_model_runner.py	2026-10-17 22:18:35.685845623 -0700
 @@ -15,6 +15,7 @@
  from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
  
@@ -3187,7 +3247,16 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
              elif self.speculative_config.use_dflash():
                  self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                  self.use_aux_hidden_state_outputs = True
-@@ -1106,6 +1117,60 @@
+@@ -797,6 +808,8 @@
+             # Blocking (sleep) event to avoid busy-polling the CUDA driver lock;
+             # under TP contention that spin can balloon and make the rank a straggler.
+             self.prepare_inputs_event = torch.cuda.Event(blocking=True)
++        elif self.parallel_config.pipeline_parallel_size > 1:  # dsv41 pp input event
++            self.prepare_inputs_event = torch.cuda.Event(blocking=True)
+ 
+         # self.cudagraph_batch_sizes sorts in ascending order.
+         if (
+@@ -1106,6 +1119,60 @@
              buf.np[:num_reqs] = np.where(valid, ids, -1)
          return buf.copy_to_gpu()
  
@@ -3248,7 +3317,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
      def _init_model_kwargs(self, num_reqs: int | None = None):
          model_kwargs = dict[str, Any]()
  
-@@ -1115,6 +1180,10 @@
+@@ -1115,6 +1182,10 @@
              model_kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
                  num_reqs
              )
@@ -3259,7 +3328,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
  
          if not self.is_pooling_model:
              return model_kwargs
-@@ -1456,18 +1525,20 @@
+@@ -1456,18 +1527,20 @@
                      # sampled token ids back because there's no direct communication
                      # between the first-stage worker and the last-stage worker.
                      new_token_ids = req_data.new_token_ids[i]
@@ -3292,7 +3361,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
              elif num_output_tokens < len(req_state.output_token_ids):
                  # Some output tokens were discarded due to a sync-KV-load
                  # failure, or output_token_ids was inflated by the optimistic
-@@ -1523,18 +1594,21 @@
+@@ -1523,18 +1596,21 @@
                  # than num_tokens_no_spec.
                  # Async scheduled PP: no new_token_ids, advance num_tokens_no_spec
                  # according to num_computed_tokens.
@@ -3321,7 +3390,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
                      self.input_batch.is_token_ids[
                          req_index, start_token_index:end_token_index
                      ] = True
-@@ -4011,13 +4085,20 @@
+@@ -4011,13 +4087,20 @@
          Checks if it's a decode batch with same amount scheduled tokens
          across all requests.
          """
@@ -3348,7 +3417,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
          )
  
      def _allow_microbatching(
-@@ -4117,12 +4198,28 @@
+@@ -4117,12 +4200,28 @@
                  uniform_decode=uniform_decode,
                  num_active_loras=num_active_loras,
                  valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
@@ -3377,7 +3446,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
          num_tokens_padded = batch_descriptor.num_tokens
          if self.compilation_config.pass_config.enable_sp:
              assert (
-@@ -4568,6 +4665,7 @@
+@@ -4568,6 +4667,7 @@
                  ubatch_slices=ubatch_slices_padded,
                  slot_mapping=slot_mappings,
                  skip_compiled=has_encoder_input,
@@ -3385,7 +3454,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
              ),
              record_function_or_nullcontext("gpu_model_runner: forward"),
              self.maybe_get_kv_connector_output(
-@@ -5651,6 +5749,17 @@
+@@ -5651,6 +5751,17 @@
              if eagle_config and isinstance(eagle_config, dict):
                  layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
  
@@ -3403,7 +3472,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
          if layer_ids and isinstance(layer_ids, (list, tuple)):
              return tuple(layer_ids)
  
-@@ -5968,6 +6077,7 @@
+@@ -5968,6 +6079,7 @@
          num_active_loras: int = 0,
          profile_seq_lens: int | None = None,
          randomize_inputs: bool = False,
@@ -3411,7 +3480,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
      ) -> tuple[torch.Tensor, torch.Tensor]:
          """
          Run a dummy forward pass to warm up/profile run or capture the
-@@ -6020,7 +6130,11 @@
+@@ -6020,7 +6132,11 @@
          # When setting max_query_len = 1, we switch to and capture the optimized
          # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
          # for GQA/MQA.
@@ -3424,7 +3493,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
  
          # Set num_scheduled_tokens based on num_tokens and max_num_seqs
          # for dummy run with LoRA so that the num_reqs collectively
-@@ -6277,6 +6391,7 @@
+@@ -6277,6 +6393,7 @@
                      batch_descriptor=batch_desc,
                      ubatch_slices=ubatch_slices_padded,
                      slot_mapping=slot_mappings,
@@ -3432,7 +3501,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
                  ),
              ):
                  outputs = self.model(
-@@ -6292,7 +6407,7 @@
+@@ -6292,7 +6409,7 @@
              else:
                  hidden_states = outputs
  
@@ -3441,7 +3510,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -7063,6 +7178,11 @@
+@@ -7063,6 +7180,11 @@
                  cudagraph_runtime_mode=CUDAGraphMode.NONE,
                  force_attention=force_attention,
                  uniform_decode=desc.uniform,
@@ -3453,7 +3522,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
                  allow_microbatching=allow_microbatching,
                  skip_eplb=True,
                  remove_lora=False,
-@@ -7083,6 +7203,11 @@
+@@ -7083,6 +7205,11 @@
                  desc.num_tokens,
                  cudagraph_runtime_mode=cudagraph_runtime_mode,
                  uniform_decode=desc.uniform,
@@ -3465,7 +3534,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
                  allow_microbatching=allow_microbatching,
                  skip_eplb=True,
                  remove_lora=False,
-@@ -7274,7 +7399,7 @@
+@@ -7274,7 +7401,7 @@
          self.calculate_reorder_batch_threshold()
  
          # Initialize drafter attention backend
@@ -3474,7 +3543,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -7311,6 +7436,14 @@
+@@ -7311,6 +7438,14 @@
                  if cg_support.value < min_cg_support.value:
                      min_cg_support = cg_support
                      min_cg_attn_backend = attn_backend.__name__
@@ -3489,7 +3558,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
          cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
              min_cg_support,
              min_cg_attn_backend,
-@@ -7328,7 +7461,7 @@
+@@ -7328,7 +7463,7 @@
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.
@@ -3498,7 +3567,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
              or self.speculative_config.uses_extract_hidden_states()
-@@ -7388,7 +7521,17 @@
+@@ -7388,7 +7523,17 @@
                  continue
              block_size = kv_cache_spec.block_size
              block_sizes.append(block_size)

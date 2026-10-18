@@ -32,6 +32,8 @@ python3 "$HERE/patch_full_qall.py"        "$V/v1/cudagraph_dispatcher.py" "$V/v1
 python3 "$HERE/patch_engram_stage_entry.py" "$V/models/deepseek_v4_1/nvidia/model.py"
 python3 "$HERE/patch_encoding_1017.py"     "$V/tokenizers/deepseek_v41_encoding.py" "$V/tokenizers/deepseek_v41.py"
 python3 "$HERE/patch_exl3.py"              "$V"
+python3 "$HERE/patch_pp_input_event.py"     "$V/v1/worker/gpu_model_runner.py"
+python3 "$HERE/patch_pp_spread.py"          "$V/v1/core/sched/scheduler.py"
 python3 "$HERE/patch_reap_router.py"       "$V/model_executor/layers/fused_moe/router/dsv4_topk.py"
 for f in $(find "$V" -name '*.py'); do python3 -c "import ast,sys;ast.parse(open('$f').read())" || { echo "SYNTAX ERROR: $f"; exit 1; }; done
 echo "overlay applied: $(find "$V" -name '*.py' | wc -l) files"

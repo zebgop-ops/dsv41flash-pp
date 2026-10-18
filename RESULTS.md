@@ -177,6 +177,18 @@ left to the boost governor (1140-1470 MHz here; FINDINGS §11).
 | load to first request | ~7 min (CPU expert repack) | ~2.5 min | ~3 min | ~3 min |
 | greedy code-edit output | – | identical to MXFP4 1017 | identical to the first EXL3 build | identical to base |
 
+With n-gram speculation (the default since FINDINGS §11's speculation fixes; `DSV41_SPEC=0` for the
+column above):
+
+| workload | EXL3, no speculation | EXL3, n-gram K=3 (default) |
+|---|---|---|
+| code edit, 400 tokens streaming | 14.4 s | 7.3-7.9 s |
+| specbench code edit (thinking on) | 27.8 tok/s | 57.8 tok/s |
+| 4 concurrent code edits | – | 136-156 tok/s aggregate |
+| 4 concurrent prose streams | 66-71 tok/s aggregate | 72-82 tok/s aggregate |
+| free prose, one stream | ~29 tok/s | ~26 tok/s |
+| KV pool | 3.75M tokens | 3.08M tokens (piecewise graphs) |
+
 Per-layer kernel times behind it (isolated layer 23 on one card, CUDA-graph replay, `exl3/ubench/`):
 
 | tokens | fused MoE kernel | cooperative MoE kernel | dense, EXL3 kernels | dense, Marlin W8A16 |

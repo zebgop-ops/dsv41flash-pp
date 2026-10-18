@@ -664,6 +664,7 @@ class EngineCore:
             and not self.async_scheduling
             and model_executed
             and getattr(self, "_dsv41_needs_draft", True)  # dsv41 prefill-chunk
+            and not (self.batch_queue is not None and _dsv41_os.environ.get("DSV41_DEFER_DRAFT", "1") == "1")  # dsv41 defer draft
         ):
             _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
             draft_token_ids = self.model_executor.take_draft_token_ids()
@@ -756,6 +757,16 @@ class EngineCore:
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
 
+            if (  # dsv41 defer draft: fetch this batch's drafts without blocking the queue
+                not deferred_scheduler_output
+                and model_executed
+                and self.check_for_draft_tokens
+                and not self.async_scheduling
+                and getattr(self, "_dsv41_needs_draft", True)
+                and _dsv41_os.environ.get("DSV41_DEFER_DRAFT", "1") == "1"
+            ):
+                self.__dict__.setdefault("_dsv41_draft_futs", {})[id(future)] = self.model_executor.collective_rpc(
+                    "take_draft_token_ids", unique_reply_rank=self.model_executor.output_rank, non_block=True)
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
@@ -773,6 +784,13 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
+        if _DSV41_CORE:  # dsv41: queue depth and batch size statistics
+            _st = self.__dict__.setdefault("_dsv41_qstat", [0, 0, 0, 0])
+            _st[0] += 1; _st[1] += len(batch_queue)
+            _st[2] += batch_queue[-1][1].total_num_scheduled_tokens; _st[3] += len(batch_queue[-1][1].num_scheduled_tokens)
+            if _st[0] % 64 == 0:
+                logger.info("DSV41 QUEUE over %d pops: mean depth %.2f, mean tokens/batch %.2f, mean reqs/batch %.2f",
+                            _st[0], _st[1] / _st[0], _st[2] / _st[0], _st[3] / _st[0])
         future, scheduler_output, exec_model_fut = batch_queue.pop()
         _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
         with (
@@ -796,6 +814,11 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        _dsv41_df = self.__dict__.get("_dsv41_draft_futs", {}).pop(id(future), None)  # dsv41 defer draft
+        if _dsv41_df is not None:
+            _dsv41_dt = _dsv41_df.result()
+            if _dsv41_dt is not None:
+                self.scheduler.update_draft_token_ids(_dsv41_dt)
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         if _DSV41_CORE and scheduler_output.total_num_scheduled_tokens:
             _dsv41_acc("update_from_output", _dsv41_time.perf_counter() - _dsv41_t)

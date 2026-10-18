@@ -393,6 +393,46 @@ Net: prose decode 16.7 → ~29 tok/s, four streams 22.6 → ~70 tok/s aggregate,
 The cooperative kernel's split-K / tile-width knobs (`EXL3_MOE_COOP_KSPLIT`, `EXL3_MOE_COOP_WIDE`) were
 swept; its defaults are best on this card.
 
+**Speculative decoding on the EXL3 build.** n-gram drafting (K=3) is synchronous in vLLM (CPU drafter:
+no async scheduling), and on the first EXL3 build it lost on prose and batches. After the speed round the
+verify step got cheap enough (a 4-token MoE step 858 µs per layer vs 286 at 1 token; dense flat) that code
+edits ran 2x faster, but four concurrent prose streams fell from ~70 to ~43 tok/s and occasionally to 30.
+Async speculation would not help this model: vLLM's async path verifies a fixed K+1 rows per request on
+every step, drafts or not, and EXL3 rows are expensive. Three engine/scheduler fixes instead, each with
+the measurement that pointed at it:
+
+1. **Deferred per-batch draft fetch** (`core.py`, `DSV41_DEFER_DRAFT=1`). With a drafter the engine called
+   `take_draft_token_ids` after every batch it launched, blocking until that batch had crossed all four
+   stages: the PP batch queue never held more than one real batch. The fetch is now a non-blocking RPC
+   issued right after the batch's `sample_tokens` (the worker answers RPCs in order, so it returns that
+   batch's drafts before the next batch can overwrite them) and applied when the batch's result is popped,
+   just before its requests become schedulable again. Queue depth went from ~1 to 4.00.
+2. **Input-buffer guard under PP** (`patch_pp_input_event.py`). With several batches queued per rank in
+   synchronous mode, a rank's stream can still wait on an upstream receive for batch k-1 while the CPU
+   writes batch k+1 into the pinned staging tensors that batch k's queued H2D copies have not read yet.
+   It surfaced as a device-side assert in `repeat_interleave` (GPU `query_start_loc` total ≠ CPU total)
+   and an Xid 43 on rank 2 under four streams. vLLM only creates `prepare_inputs_event` for async
+   scheduling; it is now created whenever PP > 1. The same race was latent in the prefill-chunk
+   pipelining of §9.
+3. **Decodes spread over the micro-batches** (`patch_pp_spread.py`, `DSV41_PP_SPREAD=1`, the idea of
+   Morrowmake's `VLLM_PP_SPREAD_DECODES`). Requests that arrive together stayed in lockstep in one batch:
+   no overlap between stages, and with drafts a 4-request step had up to 16 verify rows, past the
+   cooperative MoE kernel's 8-row range (the fused kernel takes ~4 ms per layer there). At most
+   ceil(running / pp_size) decodes are scheduled per step, so four requests ride four micro-batches.
+
+| workload (warm, 3 passes) | no speculation | n-gram K=3 with the three fixes |
+|---|---|---|
+| code edit, 529-token prompt, 400 tokens streaming | 14.4 s | 7.3-7.9 s |
+| specbench code edit (thinking on, incl. prefill) | 27.8 tok/s | 57.8 tok/s |
+| 4 concurrent code edits, 400 tokens each | – | 136-156 tok/s aggregate |
+| 4 concurrent prose streams, 200 tokens each | 66-71 tok/s aggregate | 72-82 tok/s aggregate |
+| free prose, one stream | ~29 tok/s | ~26 tok/s |
+
+Greedy code-edit output is byte-identical with and without speculation; prose diverges after ~200
+characters, the stack's usual batch-shape numerics (§7). The remaining single-stream prose cost is the
+synchronous host round trip on draft-less steps: ~4 ms of rank-0 attention-metadata building and ~2-3 ms
+of output path (py-spy on the workers; the rest of the step is GPU time).
+
 **Clocks.** Under pipeline-parallel decode each card is busy only part of every step, and the boost
 governor holds the SM clock at 1140 MHz of a possible 1695 MHz with no throttle reason active; under denser
 load it drifts up to ~1470 MHz. That is the ±30% run-to-run spread in single-stream numbers, and with

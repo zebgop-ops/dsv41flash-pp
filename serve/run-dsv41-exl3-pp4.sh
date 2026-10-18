@@ -17,11 +17,13 @@ export DSV41_CPU_EXPERT_LAYERS=${DSV41_CPU_EXPERT_LAYERS:-none}
 export DSV41_UTIL=${DSV41_UTIL:-0.91}       # at 0.93 ranks 0 and 3 sat at 60.1-60.5 GiB (cards at 61-63 have crashed); 0.91 still leaves ~4 GiB of KV per rank
 export DSV41_MAXLEN=${DSV41_MAXLEN:-262144}
 export DSV41_BATCHED=${DSV41_BATCHED:-1088}   # > max_tokens_per_mm_item (1025) for the image profiling pass
-# No n-gram speculation by default: vLLM turns async scheduling off for it (each step then pays four serial
-# host-prep + PCIe hops, ~13 ms), and an EXL3 verify step of 4 tokens costs ~2.6x a 1-token step because
-# trellis decode is ALU-bound per expert touched. Measured: prose 25 vs 16 tok/s, 4 streams 47.6 vs 30.3
-# tok/s aggregate, streaming code edit equal. DSV41_SPEC=3 turns it back on.
-export DSV41_SPEC=${DSV41_SPEC:-0}
+# n-gram speculation (K=3, prompt lookup min 5 / max 8) is on: with the deferred per-batch draft fetch
+# (core.py, DSV41_DEFER_DRAFT), the PP input-buffer guard (patch_pp_input_event) and decodes spread over
+# the micro-batches (patch_pp_spread, DSV41_PP_SPREAD) the four pipeline stages stay busy even though vLLM
+# runs n-gram drafting synchronously. Measured vs DSV41_SPEC=0: code edits ~2x (57.8 vs 27.8 tok/s),
+# 4 concurrent streams 72-82 vs 66-71 tok/s, 4 concurrent code edits 136-156 tok/s; free prose on one
+# stream ~10% slower (each draft-less step pays the synchronous host round trip, ~6 ms).
+export DSV41_SPEC=${DSV41_SPEC:-3}
 # Dense EXL3 linears (attention, shared experts, compressor, indexer; not the head) re-stored at load as
 # Marlin W8A16 (8-bit, bf16 scales per 128 inputs): 1.46x faster at 1 token, 2.24x at 4, wikitext ppl
 # -0.10% (CI includes 0) vs the EXL3 kernels; costs ~0.6 GiB of KV per rank. EXL3_DENSE_W8=0 turns it off.

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -557,6 +558,16 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        # dsv41 pp spread: cap decodes per micro-batch under PP without async scheduling
+        _dsv41_spread_cap = 0
+        if (
+            self.use_pp
+            and not self.scheduler_config.async_scheduling
+            and os.environ.get("DSV41_PP_SPREAD", "1") == "1"
+        ):
+            _pp = self.parallel_config.pipeline_parallel_size
+            _dsv41_spread_cap = max(1, -(-len(self.running) // _pp))
+        _dsv41_decodes = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
@@ -601,6 +612,11 @@ class Scheduler(SchedulerInterface):
             ):
                 req_index += 1
                 continue
+            if _dsv41_spread_cap and not request.is_prefill_chunk:  # dsv41 pp spread
+                if _dsv41_decodes >= _dsv41_spread_cap:
+                    req_index += 1
+                    continue
+                _dsv41_decodes += 1
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
