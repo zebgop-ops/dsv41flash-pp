@@ -599,7 +599,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (compressor kv_score, indexer.weights_proj). fused_wqa_wkv stays on
         # the default stream.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
-        if _dsv41_os.environ.get("DSV41_EXL3") == "1":  # dsv41 exl3 streams: exllamav3 kernels share one lock buffer
+        if _dsv41_os.environ.get("DSV41_EXL3") == "1" and _dsv41_os.environ.get("DSV41_EXL3_DENSE", "1") == "1":  # dsv41 exl3 streams: exllamav3 kernels share one lock buffer
             aux_stream_list = None
 
         # Reserved topk indices buffer for all Indexer layers to reuse.

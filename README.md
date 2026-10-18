@@ -61,7 +61,10 @@ drafter, FINDINGS.md §8), `DSV41_CG` (`FULL_DECODE_ONLY` without speculation,
 `DSV41_EXTRA_DOCKER` (e.g. `"-e CUDA_LAUNCH_BLOCKING=1"`), `DSV41_HF_REPO` (another checkpoint
 in the same cache; `serve/run-dsv41reap-pp4.sh` wraps it for the REAP-272E model on :8005,
 `serve/run-dsv41-1017-pp4.sh` for the 2026-10-17 weights refresh on :8007, FINDINGS.md §10;
-`serve/run-dsv41-exl3-pp4.sh` for its EXL3 2.9 bpw pack with every expert on the GPUs, :8008, FINDINGS.md §11), and
+`serve/run-dsv41-exl3-pp4.sh` for its EXL3 2.9 bpw pack with every expert on the GPUs, :8008, FINDINGS.md §11;
+`serve/run-dsv41-hybrid-pp4.sh`, the default on :8008, for the pack's routed experts with the abliterated
+checkpoint's own FP8 dense weights, DSpark drafting and 8 sequences, FINDINGS.md §12), `DSV41_INDEX_FILTER`
+(read each tensor only from the shard a merged index names), `DSV41_PREFIX_CACHE` (1 in the EXL3 wrappers), and
 the diagnostic switches in [FINDINGS.md](FINDINGS.md). It pre-flights the checkpoint, the
 driver (kernel module vs userland mismatch after an upgrade), other servers on the cards,
 and CUDA init on every GPU before touching anything.
@@ -152,6 +155,8 @@ serve/run-dsv41-pp4.sh   production launcher (preflight, mounts, all flags); run
                          the REAP-272E checkpoint (link-reap-engram.sh links the base Engram shards in),
                          run-dsv41-1017-pp4.sh for the 2026-10-17 checkpoint (util 0.93 layout, FINDINGS.md §10)
                          run-dsv41-exl3-pp4.sh for the 1017 EXL3 2.9 bpw pack (all experts on the GPUs, FINDINGS.md §11)
+                         run-dsv41-hybrid-pp4.sh: EXL3 routed experts + the abliterated FP8 dense weights, DSpark,
+                         8 sequences (tools/make-hybrid.py builds the snapshot; FINDINGS.md §12)
 overlay/exl3/            dsv41_exl3.py: EXL3 (ExLlamaV3 trellis) routed experts + dense linears for this image
                          (ported from Mia'a AI Lab's GB10 overlay; one stream for every exllamav3 kernel)
 exl3/                    build-exllamav3.sh builds exllamav3 1.6.3's CUDA extension for sm_80 inside the image
@@ -165,6 +170,7 @@ overlay/patch_*.py       anchor-based, idempotent patch scripts; apply-overlay.s
                          budgets; patch_engram_stage_entry: Engram on a PP stage's first layer — FINDINGS.md §10)
                          (patch_exl3: registry, packed head/wo_a names, compressor + indexer quant config,
                          EXL3 o-projection, single-stream model — FINDINGS.md §11)
+                         (patch_index_filter: per-tensor shard selection for hybrid snapshots — FINDINGS.md §12)
 overlay/make-overlay.sh  extracts pristine files from the image (for diffing / re-seeding)
 overlay/engram_ssd/      row_store.cpp + build.sh, engram_ssd.py, CPU/GPU tests
 overlay/hybrid/          cpu_experts.py, cpu_moe.cpp/.py (native CPU MoE), marlin_staged.py,

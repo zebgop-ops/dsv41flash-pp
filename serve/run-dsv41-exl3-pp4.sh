@@ -24,6 +24,9 @@ export DSV41_BATCHED=${DSV41_BATCHED:-1088}   # > max_tokens_per_mm_item (1025) 
 # 4 concurrent streams 72-82 vs 66-71 tok/s, 4 concurrent code edits 136-156 tok/s; free prose on one
 # stream ~10% slower (each draft-less step pays the synchronous host round trip, ~6 ms).
 export DSV41_SPEC=${DSV41_SPEC:-3}
+# Prefix caching: a multi-turn chat or agent loop re-sends its whole history every turn; with the cache only the
+# new turn is prefilled. Validated against no-cache outputs with tools/prefixtest.py (FINDINGS §11).
+export DSV41_PREFIX_CACHE=${DSV41_PREFIX_CACHE:-1}
 # Dense EXL3 linears (attention, shared experts, compressor, indexer; not the head) re-stored at load as
 # Marlin W8A16 (8-bit, bf16 scales per 128 inputs): 1.46x faster at 1 token, 2.24x at 4, wikitext ppl
 # -0.10% (CI includes 0) vs the EXL3 kernels; costs ~0.6 GiB of KV per rank. EXL3_DENSE_W8=0 turns it off.

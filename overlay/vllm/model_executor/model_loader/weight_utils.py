@@ -850,6 +850,26 @@ def _dsv41_skip(name: str) -> bool:
     return _DSV41_SKIP_RE is not None and _DSV41_SKIP_RE.search(name) is not None
 
 
+_DSV41_INDEX_MAP = None  # dsv41 index filter
+
+
+def _dsv41_index_map():
+    global _DSV41_INDEX_MAP
+    d = _dsv41_os.environ.get("DSV41_INDEX_FILTER")
+    if not d:
+        return None
+    if _DSV41_INDEX_MAP is None:
+        import json as _json
+        _DSV41_INDEX_MAP = _json.load(open(_dsv41_os.path.join(d, "model.safetensors.index.json")))["weight_map"]
+    return _DSV41_INDEX_MAP
+
+
+def _dsv41_skip_file(name: str, st_file: str) -> bool:
+    """True when the hybrid index maps `name` to a different shard (or not at all)."""
+    m = _dsv41_index_map()
+    return m is not None and m.get(name) != _dsv41_os.path.basename(st_file)
+
+
 def _dsv41_get_tensor(f, name: str):
     try:
         return f.get_tensor(name)
@@ -953,7 +973,7 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if not should_skip_weight(name, local_expert_ids):
+                if not should_skip_weight(name, local_expert_ids) and not _dsv41_skip_file(name, st_file):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
@@ -970,7 +990,7 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids) or _dsv41_skip(name):
+                    if should_skip_weight(name, local_expert_ids) or _dsv41_skip(name) or _dsv41_skip_file(name, st_file):
                         continue
                     state_dict[name] = _dsv41_get_tensor(f, name)
 
@@ -988,7 +1008,7 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids) or _dsv41_skip(name):
+                    if should_skip_weight(name, local_expert_ids) or _dsv41_skip(name) or _dsv41_skip_file(name, st_file):
                         continue
                     param = _dsv41_get_tensor(f, name)
                     yield name, param

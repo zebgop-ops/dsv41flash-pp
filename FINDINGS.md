@@ -443,6 +443,75 @@ here: it is a host setting for the owner of the cards.
 at a 262,144-token window (0.93 put ranks 0 and 3 at 60.1-60.5 GiB, too close to the 61-63 GiB where
 cards have crashed). Numbers in RESULTS.md.
 
+## 12. EXL3 experts with the original dense weights, DSpark, 8 sequences
+
+Follow-ups taken from comparing this stack with CurtisAccelerate's EXL3 CMP-170HX kit, keeping PP4.
+
+**Hybrid checkpoint.** Only the routed experts have to shrink to fit four 64 GB cards; the EXL3 pack also
+re-quantizes attention, shared experts, compressor, indexer and head (5-6 bits), and our loader then
+re-stored those as Marlin W8A16, i.e. 8-bit storage carrying 5-bit error. The original FP8 tensors take
+the same ~1 byte per weight, run on the same Marlin kernel family on sm_80 (MXFP8 linears; `wo_a`
+through the emulation path into one bf16 bmm), and carry no extra error. The head goes back to bf16
+(+0.8 GiB on the last rank). There is a second reason: the abliteration edited only `attn.wo_b` and
+`ffn.shared_experts.w2` (rank-2 projection, requantized to FP8 with the original scales), and the
+routed experts are bit-identical to the original 1017. The EXL3 pack was quantized from the original,
+so the pure-EXL3 server was *not* abliterated; the hybrid is, with experts that are the right ones for it.
+
+- `tools/make-hybrid.py` builds a snapshot of relative symlinks into both HF snapshots (48 FP8 shards,
+  40 EXL3 shards that hold routed experts), a merged `model.safetensors.index.json` (main-layer
+  `ffn.experts.*` from the pack, everything else, `mtp.*` included, from the base) and a `config.json`
+  whose quantization is `exl3` with `scope: routed_experts_only` and the base's FP8 config as
+  `non_routed_quantization`.
+- Both checkpoints name norms, gates, embeddings and attention sinks identically, so the loader would
+  read every tensor of every listed shard and keep the last one. `patch_index_filter.py` makes
+  `safetensors_weights_iterator` take a tensor only from the shard the index names
+  (`DSV41_INDEX_FILTER=<snapshot>`).
+- `Exl3Config` in hybrid scope builds an inner `DeepseekV4FP8Config` and delegates everything except the
+  main layers' `RoutedExperts` to it; compressor `fused_wkv_wgate` and indexer `wk` (bf16 in the
+  checkpoint, but given the quant config by the EXL3 patch) get `UnquantizedLinearMethod`, the head none;
+  attribute reads (`weight_block_size`, `is_scale_e8m0`) fall through to the inner config. With no EXL3
+  dense layers left, `DSV41_EXL3_DENSE=0` keeps vLLM's aux streams and the shared-expert stream.
+- Result (same harness, paired over the 36 wikitext windows): perplexity 2.8200 vs 2.8512 for the pure
+  pack (−1.09%, per-window nll −0.0110 ± 0.0046), against 2.7530 for the MXFP4 1017: a third of the
+  quantization gap closed. Speed unchanged (prose 26-27 tok/s, code edit 58-65 tok/s with n-gram),
+  prefill unchanged, needle at 28k recalled.
+
+**DSpark instead of n-gram.** With every expert on the GPUs, verify rows are cheap (the cooperative MoE
+kernel now covers up to 42 tokens), so the model's own drafter pays on prose too. It taps layers 37-39 and
+needs 8.4 GiB with its embedding on the last rank: 10,11,11,8 fits it (cuts at 10 and 21 sit inside index
+groups, covered by the shadow plan; 53.0-54.3 GiB per rank before KV, pool 1.26M tokens). The draft
+loads with the original FP4/FP8 kernels (its layers are numbered 40-42, outside the hybrid's EXL3 range).
+
+| workload (warm) | hybrid, n-gram K=3 | hybrid, DSpark K=5 |
+|---|---|---|
+| free prose, 400 tokens streaming | 14.8-15.0 s | 12.7-12.9 s |
+| specbench prose (thinking on) | 26.2-27.2 tok/s | 31.7-32.0 tok/s (89% of drafted accepted, 1.1-1.15/step) |
+| code edit, 400 tokens streaming | 6.5-7.4 s | 5.7-5.8 s |
+| specbench code edit | 58.0-65.5 tok/s | 68.5-69.4 tok/s (4.7 tokens/step) |
+| 4 prose streams, 200 tokens each | 81.7-84.6 tok/s aggregate | 87.7-90.8 tok/s aggregate |
+| prefill 1.1k / 4.3k / 24k tokens | 0.79k / 1.78k / 2.57k tok/s | 0.73k / 1.69k / 2.33k tok/s |
+
+Prefill pays 5-9% for the two 11-layer ranks. A prefix-cache hit does not cost acceptance (cold and hit
+code edits: 4.84 / 4.76 tokens per step, identical text), and the cache cut a 6k-token follow-up's TTFT
+from 5.9 s to 0.44 s.
+
+**max-num-seqs 8.** With 8 sequences the launcher's capture list grew to 48 rows (8 requests x K+1) and
+the estimated CUDA-graph pool to 8.4 GiB per rank, leaving no KV ("No available memory for the cache
+blocks"). Under decode spreading a step never carries more than ceil(8/4) = 2 requests, i.e. 12 verify
+rows, so the 4-request list `[1,2,3,4,5,6,8,10,12,18,24]` covers it (1.34 GiB pool, 1.23M-token KV).
+8 prose streams: 144-145 tok/s in one wave vs 86-89 tok/s in two; single-stream numbers unchanged. A mixed
+load (6 concurrent code edits + a 29k needle + an 8.6k prefill) completed with no errors or Xid.
+
+**Not done: a packed PP hop.** Morrowmake's `VLLM_PP_PACKED_HOP` copies a hop's tensors into one buffer
+and sends it with one NCCL op (V2 runner). Here a hop carries the mHC streams, `pre_mix`, shadowed
+index-source activations and candidate blocks. Measured between two cards (NCCL over host shared memory,
+~1.6 GB/s): 1 token 144 → 49 µs, 6 tokens 264 → 232 µs, 12 tokens 482 → 453 µs, a 1088-token prefill
+chunk 38.8 ms either way. At most ~0.3 ms of a ~36 ms decode step over three hops; prefill hops are
+bandwidth-bound. The CPU-side metadata round trip it also removes stays ahead of the GPU in our traces.
+
+**Self-check.** The one-time tiered-prefill comparison used to run on the memory-profiling pass
+(placeholder activations, all tokens on 6 experts) and always logged NaN; it now waits for finite input.
+
 ## Diagnostic switches (all off by default)
 
 | switch | effect |

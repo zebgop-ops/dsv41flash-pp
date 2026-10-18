@@ -21,7 +21,7 @@ echo "--- itl code edit (thinking off, streaming)"; python3 tools/itl.py $URL 40
 {
   echo "=== $tag $(date -u +%FT%T) ==="
   echo "--- wikitext-2 test perplexity"; python3 tools/quality.py ppl $URL eval/wikitext2-test.txt 73728 8192 2>&1 | tail -1
-  echo "--- python stdlib code perplexity"; python3 tools/quality.py ppl $URL eval/stdlib-code.txt 2>&1 | tail -1
+  echo "--- python stdlib code perplexity"; python3 tools/quality.py ppl $URL eval/stdlib-code.txt 32768 8192 2>&1 | tail -1
   echo "=== $tag MMLU 1000 paired $(date -u +%FT%T) ==="; DSV41_MC_DUMP=eval/mc-$tag-1000.json python3 tools/quality.py mc $URL eval/mmlu-test.json 1000 0 2>&1 | tail -1
 } > eval/$tag.txt 2>&1
 grep -o '"ppl": [0-9.]*\|"accuracy": [0-9.]*\|"mean_margin": [0-9.]*' eval/$tag.txt

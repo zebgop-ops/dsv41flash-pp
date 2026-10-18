@@ -212,6 +212,34 @@ The pack's card reports +0.4% prose / +1.8% code perplexity on its own held-out 
 MMLU difference to the unquantized 0909 base is not significant over 1000 paired questions (REAP's −7.7
 points was, at p < 1e-4).
 
+### 1017 hybrid: EXL3 routed experts + the abliterated checkpoint's FP8 dense weights, DSpark, 8 sequences (`serve/run-dsv41-hybrid-pp4.sh`, :8008, default)
+
+Same box, prompts and harnesses as the EXL3 tables above; FINDINGS §12. Partition 10,11,11,8 (DSpark on the
+last rank), utilization 0.91, 262,144-token window, prefix caching on, max-num-seqs 8.
+
+| workload (warm) | EXL3 pack, n-gram K=3 | hybrid, n-gram K=3 | hybrid, DSpark K=5 (default) |
+|---|---|---|---|
+| free prose, 400 tokens streaming | 15.1-17.8 s | 14.8-15.0 s | 12.7-13.0 s |
+| specbench prose / code edit (thinking on) | 25.9-26.4 / 57.8 tok/s | 26.2-27.2 / 58.0-65.5 tok/s | 31.7-32.0 / 68.5-69.4 tok/s |
+| code edit, 529-token prompt, 400 tokens streaming | 7.3-7.9 s | 6.5-7.4 s | 5.7-5.8 s |
+| 4 prose streams, 200 tokens each | 72-82 tok/s aggregate | 82-85 tok/s | 84-91 tok/s |
+| 8 prose streams, 200 tokens each | – | – | 87 tok/s at 4 sequences, 144-145 tok/s at 8 |
+| prefill 1.1k / 4.3k / 24k-token prompts | – | 0.79k / 1.78k / 2.57k tok/s | 0.73k / 1.69k / 2.33k tok/s |
+| 6k-token follow-up on a cached prefix (TTFT) | 0.45 s | – | 0.44 s (cold 5.9 s) |
+| KV pool | 3.08M tokens | 2.04M tokens | 1.23M tokens (4.7x a 262k request) |
+| GPU used per rank while serving | 58.8 / 54.3 / 52.9 / 59.2 GiB | 57.2 / 53.1 / 51.8 / 58.8 GiB | 56.9 / 58.1 / 58.4 / 57.3 GiB |
+
+Quality (paired with the earlier rows of this file):
+
+| metric | 0909 base | MXFP4 1017 | EXL3 pack (final) | hybrid + DSpark |
+|---|---|---|---|---|
+| wikitext-2 perplexity | 2.7147 | 2.7530 | 2.8512 | 2.8200 (−1.09% vs the pack, per-window nll −0.0110 ± 0.0046; +2.4% vs MXFP4 1017) |
+| MMLU-1000 | 84.4% | – | 83.2% | 84.0% (vs base p = 0.70; vs the pack p = 0.23) |
+| GSM8K-200 | – | – | 197/200 (778 s) | 196/200 (568 s; one item differs, #119 truncated in both) |
+| needle, 28k tokens | – | – | recalled | recalled (also under a mixed 8-request load) |
+
+The hybrid is also abliterated, which the pure pack was not (its dense weights came from the original 1017).
+
 ## Memory
 
 | rank | layers | GPU weights + non-torch | KV pool |

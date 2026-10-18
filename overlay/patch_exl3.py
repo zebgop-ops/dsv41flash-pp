@@ -116,7 +116,7 @@ patch("models/deepseek_v4_1/ampere/ampere_sparse.py", [
 patch("models/deepseek_v4_1/nvidia/model.py", [
     ('        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]\n',
      '        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]\n'
-     '        if _dsv41_os.environ.get("DSV41_EXL3") == "1":  # dsv41 exl3 streams: exllamav3 kernels share one lock buffer\n'
+     '        if _dsv41_os.environ.get("DSV41_EXL3") == "1" and _dsv41_os.environ.get("DSV41_EXL3_DENSE", "1") == "1":  # dsv41 exl3 streams: exllamav3 kernels share one lock buffer\n'
      '            aux_stream_list = None\n'),
 ], "dsv41 exl3 streams")
 print("done")

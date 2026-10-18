@@ -98,13 +98,18 @@ fi
 MOUNTS+=(-v "$RUNDIR/overlay/engram_ssd:/opt/dsv41/engram_ssd:ro" -v "$RUNDIR/overlay/hybrid:/opt/dsv41/hybrid:ro" -v "$RUNDIR/kt/site:/opt/dsv41/kt-site:ro")
 PYPATH=/opt/dsv41:/opt/dsv41/kt-site
 QUANT_ARGS=()
+PREFIX_FLAG=--no-enable-prefix-caching   # DSV41_PREFIX_CACHE=1: reuse KV of shared prompt prefixes (multi-turn chats, agents)
+[ "${DSV41_PREFIX_CACHE:-0}" = 1 ] && PREFIX_FLAG=--enable-prefix-caching
 EXL3_ENV=()
 if [ "$EXL3" = 1 ]; then
   mkdir -p "$RUNDIR/exl3/tune-cache"
   MOUNTS+=(-v "$RUNDIR/exl3/site:/opt/dsv41/exl3-site:ro" -v "$RUNDIR/overlay/exl3:/opt/dsv41/exl3:ro" -v "$RUNDIR/exl3/tune-cache:/opt/dsv41/exl3-tune")
   PYPATH="$PYPATH:/opt/dsv41/exl3-site:/opt/dsv41/exl3"
   QUANT_ARGS+=(--quantization exl3)
-  EXL3_ENV=(-e VLLM_DISABLE_SHARED_EXPERTS_STREAM=1 -e EXLLAMAV3_TUNE_CACHE=/opt/dsv41/exl3-tune -e EXL3_PRETUNE_ROWS="${EXL3_PRETUNE_ROWS:-1,2,3,4,6,8,12,16}")   # one stream only (shared lock buffer); persistent gemm autotune cache; pre-tune rows before capture
+  EXL3_ENV=(-e EXLLAMAV3_TUNE_CACHE=/opt/dsv41/exl3-tune -e EXL3_PRETUNE_ROWS="${EXL3_PRETUNE_ROWS:-1,2,3,4,6,8,12,16}" -e DSV41_EXL3_DENSE="${DSV41_EXL3_DENSE:-1}")
+  # EXL3 dense linears share exllamav3's lock buffer with the MoE kernels: one stream only. A hybrid checkpoint
+  # (EXL3 experts, original FP8 dense) keeps the side streams.
+  [ "${DSV41_EXL3_DENSE:-1}" = 1 ] && EXL3_ENV+=(-e VLLM_DISABLE_SHARED_EXPERTS_STREAM=1)   # one stream only (shared lock buffer); persistent gemm autotune cache; pre-tune rows before capture
 fi
 
 # Tensors the GPU loader must not even mmap: Engram tables in SSD mode, and the experts of
@@ -151,7 +156,7 @@ docker run -d --name "$NAME" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$GPU_OR
   -e PYTHONPATH="$PYPATH" -e DSV41_EXL3="$EXL3" -e DSV41_EXL3_K_MAP="$MODEL/exl3_k_map.json" -e EXL3_FUSED_MOE="${EXL3_FUSED_MOE:-1}" -e EXL3_TEMP_ROWS_FUSED="${EXL3_TEMP_ROWS_FUSED:-256}" -e EXL3_PREFILL_TIERS="${EXL3_PREFILL_TIERS:-1}" -e EXL3_DENSE_W8="${EXL3_DENSE_W8:-0}" -e EXL3_MOE_COOP="${EXL3_MOE_COOP:-1}" -e EXL3_MOE_NUM_ACTIVE="${EXL3_MOE_NUM_ACTIVE:--1}" \
   -e VLLM_PP_LAYER_PARTITION="$PARTITION" \
   -e DSV41_CPU_EXPERT_LAYERS="$CPU_LAYERS" -e DSV41_ENGRAM_STORAGE="$ENGRAM" \
-  -e DSV41_ENGRAM_ZERO="${DSV41_ENGRAM_ZERO:-0}" -e DSV41_DEBUG_STATS="${DSV41_DEBUG_STATS:-0}" -e DSV41_MHC_TORCH="${DSV41_MHC_TORCH:-0}" -e DSV41_DEBUG_DUMP="${DSV41_DEBUG_DUMP:-}" -e DSV41_CPU_MOE="${DSV41_CPU_MOE:-native}" -e DSV41_DEBUG_TIMING="${DSV41_DEBUG_TIMING:-0}" -e DSV41_DEBUG_PROFILE="${DSV41_DEBUG_PROFILE:-0}" -e DSV41_DEBUG_PROFILE_T="${DSV41_DEBUG_PROFILE_T:-1}" -e DSV41_DEBUG_GDUMP="${DSV41_DEBUG_GDUMP:-}" -e DSV41_DEBUG_SPEC="${DSV41_DEBUG_SPEC:-0}" -e DSV41_DEBUG_ENGRAM="${DSV41_DEBUG_ENGRAM:-0}" -e DSV41_PREFILL_EAGER="${DSV41_PREFILL_EAGER:-1}" -e DSV41_FULL_Q1="${DSV41_FULL_Q1:-1}" -e DSV41_DEBUG_CORE="${DSV41_DEBUG_CORE:-0}" -e DSV41_DEBUG_TRACE="${DSV41_DEBUG_TRACE:-0}" -e DSV41_DEBUG_TRACE_PREFILL="${DSV41_DEBUG_TRACE_PREFILL:-0}" -e DSV41_DEBUG_DSPARK="${DSV41_DEBUG_DSPARK:-0}" -e DSV41_DSPARK_CONF="${DSV41_DSPARK_CONF:-0.7}" -e DSV41_DEBUG_SYNC="${DSV41_DEBUG_SYNC:-0}" -e DSV41_DRAFT_SKIP_PREFILL="${DSV41_DRAFT_SKIP_PREFILL:-1}" -e DSV41_DEFER_DRAFT="${DSV41_DEFER_DRAFT:-1}" -e DSV41_PP_SPREAD="${DSV41_PP_SPREAD:-1}" -e DSV41_CPU_EXPERT_THREADS="${DSV41_CPU_EXPERT_THREADS:-16}" -v /home/r/dsv41-run/dump:/dump -e DSV41_MODEL_DIR="${ENGRAM_MODEL_DIR:-$MODEL}" -e DSV41_MEM_CAP_FRACTION="$MEM_CAP" -e DSV41_SKIP_WEIGHT_RE="$SKIP_RE" \
+  -e DSV41_ENGRAM_ZERO="${DSV41_ENGRAM_ZERO:-0}" -e DSV41_DEBUG_STATS="${DSV41_DEBUG_STATS:-0}" -e DSV41_MHC_TORCH="${DSV41_MHC_TORCH:-0}" -e DSV41_DEBUG_DUMP="${DSV41_DEBUG_DUMP:-}" -e DSV41_CPU_MOE="${DSV41_CPU_MOE:-native}" -e DSV41_DEBUG_TIMING="${DSV41_DEBUG_TIMING:-0}" -e DSV41_DEBUG_PROFILE="${DSV41_DEBUG_PROFILE:-0}" -e DSV41_DEBUG_PROFILE_T="${DSV41_DEBUG_PROFILE_T:-1}" -e DSV41_DEBUG_GDUMP="${DSV41_DEBUG_GDUMP:-}" -e DSV41_DEBUG_SPEC="${DSV41_DEBUG_SPEC:-0}" -e DSV41_DEBUG_ENGRAM="${DSV41_DEBUG_ENGRAM:-0}" -e DSV41_PREFILL_EAGER="${DSV41_PREFILL_EAGER:-1}" -e DSV41_FULL_Q1="${DSV41_FULL_Q1:-1}" -e DSV41_DEBUG_CORE="${DSV41_DEBUG_CORE:-0}" -e DSV41_DEBUG_TRACE="${DSV41_DEBUG_TRACE:-0}" -e DSV41_DEBUG_TRACE_PREFILL="${DSV41_DEBUG_TRACE_PREFILL:-0}" -e DSV41_DEBUG_DSPARK="${DSV41_DEBUG_DSPARK:-0}" -e DSV41_DSPARK_CONF="${DSV41_DSPARK_CONF:-0.7}" -e DSV41_DEBUG_SYNC="${DSV41_DEBUG_SYNC:-0}" -e DSV41_DRAFT_SKIP_PREFILL="${DSV41_DRAFT_SKIP_PREFILL:-1}" -e DSV41_DEFER_DRAFT="${DSV41_DEFER_DRAFT:-1}" -e DSV41_PP_SPREAD="${DSV41_PP_SPREAD:-1}" -e DSV41_INDEX_FILTER="${DSV41_INDEX_FILTER:-}" -e DSV41_CPU_EXPERT_THREADS="${DSV41_CPU_EXPERT_THREADS:-16}" -v /home/r/dsv41-run/dump:/dump -e DSV41_MODEL_DIR="${ENGRAM_MODEL_DIR:-$MODEL}" -e DSV41_MEM_CAP_FRACTION="$MEM_CAP" -e DSV41_SKIP_WEIGHT_RE="$SKIP_RE" \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e VLLM_USE_V2_MODEL_RUNNER=0 -e PYTHONFAULTHANDLER=1 \
   "${EXL3_ENV[@]}" ${DSV41_EXTRA_DOCKER:-} \
   "$IMG" \
@@ -159,7 +164,7 @@ docker run -d --name "$NAME" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$GPU_OR
   --pipeline-parallel-size "$PP" --gpu-memory-utilization "$UTIL" "${QUANT_ARGS[@]}" \
   --max-model-len "$MAXLEN" --max-num-seqs "$SEQS" --max-num-batched-tokens "$BATCHED" \
   --attention-backend TRITON_MLA_SPARSE_DSV41 --kv-cache-dtype fp8 --attention-config '{"indexer_kv_dtype":"fp8"}' \
-  -cc.cudagraph_mode="$CG" --no-enable-prefix-caching \
+  -cc.cudagraph_mode="$CG" "$PREFIX_FLAG" \
   "${SPEC_ARGS[@]}" \
   --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41 --enable-auto-tool-choice \
   $EXTRA_ARGS

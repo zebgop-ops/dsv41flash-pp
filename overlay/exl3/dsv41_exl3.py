@@ -275,6 +275,26 @@ class Exl3Config(QuantizationConfig):
         self.raw_config = dict(kwargs)
         if self.codebook not in ("mul1", "mcg"):
             raise ValueError(f"EXL3 overlay implements codebook mul1|mcg, got {self.codebook!r}")
+        # Hybrid checkpoint (scope routed_experts_only): EXL3 only for the main layers' routed experts; every
+        # other layer keeps the checkpoint's own quantization (non_routed_quantization, DeepSeek FP8 + FP4
+        # draft experts), and the bf16 compressor / indexer-wk / head stay unquantized as in the original.
+        self.scope = str(kwargs.get("scope", "all"))
+        self.inner = None
+        if self.scope == "routed_experts_only":
+            from vllm.model_executor.layers.quantization import get_quantization_config
+            nrq = dict(kwargs["non_routed_quantization"])
+            self.inner = get_quantization_config("deepseek_v4_fp8").from_config(nrq)
+            self.n_main_layers = int(kwargs.get("num_main_layers", 40))
+
+    def __getattr__(self, name):  # hybrid: model code reads weight_block_size, is_scale_e8m0, ... from the config
+        inner = self.__dict__.get("inner")
+        if inner is not None and not name.startswith("__"):
+            return getattr(inner, name)
+        raise AttributeError(name)
+
+    def apply_vllm_mapper(self, hf_to_vllm_mapper):
+        if self.inner is not None and hasattr(self.inner, "apply_vllm_mapper"):
+            self.inner.apply_vllm_mapper(hf_to_vllm_mapper)
 
     def get_name(self) -> str:
         return "exl3"
@@ -309,6 +329,20 @@ class Exl3Config(QuantizationConfig):
         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
         from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
+        if self.inner is not None:   # hybrid
+            if getattr(self, "packed_modules_mapping", None) is not None:
+                self.inner.packed_modules_mapping = self.packed_modules_mapping
+            if isinstance(layer, RoutedExperts):
+                m = re.search(r"layers\.(\d+)\.", prefix)
+                if m is not None and int(m.group(1)) < self.n_main_layers:
+                    return Exl3MoEMethod(layer.moe_config, self, prefix=prefix)
+                return self.inner.get_quant_method(layer, prefix)
+            if isinstance(layer, ParallelLMHead):
+                return None                                    # bf16 head, as in the original model
+            if isinstance(layer, LinearBase) and ("compressor.fused_wkv_wgate" in prefix or "indexer.wk" in prefix):
+                from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+                return UnquantizedLinearMethod()               # bf16 in the checkpoint
+            return self.inner.get_quant_method(layer, prefix)
         if isinstance(layer, RoutedExperts):
             return Exl3MoEMethod(layer.moe_config, self, prefix=prefix)
         if isinstance(layer, ParallelLMHead):
@@ -423,7 +457,8 @@ def apply_exl3_python_loop(x2d, ids, weights, inners, limit, *, only_experts=Non
     return out
 
 
-COOP_MAX_TOKENS = 8                        # exl3_moe_coop handles bsz 1..MAX_BSZN (8)
+COOP_MAX_SLOTS = 256                       # exl3_moe_coop scratch limit: tokens * top_k <= 256 (42 tokens at top-6)
+COOP_MAX_TOKENS = int(os.environ.get("EXL3_MOE_COOP_MAX_TOKENS", "42"))
 _COOP_SCRATCH: dict[tuple, dict[str, torch.Tensor]] = {}
 
 
@@ -438,8 +473,9 @@ def _coop_scratch(device, topk: int, H: int, I: int) -> dict[str, torch.Tensor]:
     key = (str(device), topk, H, I)
     sc = _COOP_SCRATCH.get(key)
     if sc is None:
-        slots = COOP_MAX_TOKENS * topk
-        ctr_len = slots * (I // 128) + COOP_MAX_TOKENS * (H // 128) + 2 + (slots + 1) + slots
+        rows = min(COOP_MAX_TOKENS, COOP_MAX_SLOTS // topk)
+        slots = rows * topk
+        ctr_len = slots * (I // 128) + rows * (H // 128) + 2 + (slots + 1) + slots
         sc = {
             "had_g": torch.empty((slots, H), dtype=torch.float16, device=device),
             "had_u": torch.empty((slots, H), dtype=torch.float16, device=device),
@@ -478,7 +514,7 @@ def apply_exl3_coop_moe(x2d, ids, weights, layer, limit):
 
 
 def apply_exl3_fused_moe(x2d, ids, weights, layer, inners, limit):
-    if x2d.shape[0] <= COOP_MAX_TOKENS and coop_enabled():
+    if x2d.shape[0] <= min(COOP_MAX_TOKENS, COOP_MAX_SLOTS // int(ids.shape[-1])) and coop_enabled():
         return apply_exl3_coop_moe(x2d, ids, weights, layer, limit)
     tokens, hidden = x2d.shape
     n_exp = len(inners)
@@ -539,13 +575,17 @@ def _exl3_prefill_tiered(x2d, xh, out, ids, weights, counts, expert_count, token
     if fat:
         apply_exl3_python_loop(x2d, ids, weights, inners, limit, only_experts=fat, out=out)
     if not _TIER_CHECKED[0] and os.environ.get("EXL3_TIER_CHECK", "1") != "0":
-        _TIER_CHECKED[0] = True   # one-time check against the plain 16-row fused path with row tiles
+        # one-time check against the plain 16-row fused path with row tiles. The memory-profiling pass feeds
+        # placeholder activations (every token on the same 6 experts, non-finite sums), so wait for real input.
         ref = torch.zeros_like(out)
         max_rows = max(ch)
         if max_rows <= cap:
             _exl3_moe_launch(xh, ref, expert_count, token_sorted, weight_sorted, temps, ptrs, layer, limit)
         else:
             _exl3_moe_row_tiles(xh, ref, counts, token_sorted, weight_sorted, temps, ptrs, layer, limit, max_rows)
+        if not (bool(torch.isfinite(ref).all()) and bool(torch.isfinite(out).all()) and float(ref.norm()) > 0):
+            return out
+        _TIER_CHECKED[0] = True
         logger.info("EXL3 tiered prefill check (%d tokens, %d fat experts, max rows %d): rel err vs 16-row path %.2e",
                     x2d.shape[0], len(fat), max_rows, ((out - ref).norm() / ref.norm()).item())
     return out

@@ -462,8 +462,8 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_e
          """With PD+DCP, the real value isn't known until block_size is finalized,
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/model_loader/weight_utils.py vllm/model_executor/model_loader/weight_utils.py
 --- image-official/model_executor/model_loader/weight_utils.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/model_executor/model_loader/weight_utils.py	2026-09-11 14:20:26.513690245 -0700
-@@ -831,6 +831,32 @@
++++ vllm/model_executor/model_loader/weight_utils.py	2026-10-18 06:27:16.117931390 -0700
+@@ -831,6 +831,52 @@
      threading.Thread(target=_run_prefetch, daemon=True).start()
  
  
@@ -486,6 +486,26 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_e
 +    return _DSV41_SKIP_RE is not None and _DSV41_SKIP_RE.search(name) is not None
 +
 +
++_DSV41_INDEX_MAP = None  # dsv41 index filter
++
++
++def _dsv41_index_map():
++    global _DSV41_INDEX_MAP
++    d = _dsv41_os.environ.get("DSV41_INDEX_FILTER")
++    if not d:
++        return None
++    if _DSV41_INDEX_MAP is None:
++        import json as _json
++        _DSV41_INDEX_MAP = _json.load(open(_dsv41_os.path.join(d, "model.safetensors.index.json")))["weight_map"]
++    return _DSV41_INDEX_MAP
++
++
++def _dsv41_skip_file(name: str, st_file: str) -> bool:
++    """True when the hybrid index maps `name` to a different shard (or not at all)."""
++    m = _dsv41_index_map()
++    return m is not None and m.get(name) != _dsv41_os.path.basename(st_file)
++
++
 +def _dsv41_get_tensor(f, name: str):
 +    try:
 +        return f.get_tensor(name)
@@ -496,24 +516,33 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_e
  def safetensors_weights_iterator(
      hf_weights_files: list[str],
      use_tqdm_on_load: bool,
-@@ -944,9 +970,9 @@
+@@ -927,7 +973,7 @@
+             with open(st_file, "rb") as f:
+                 state_dict = load(f.read())
+             for name, param in state_dict.items():
+-                if not should_skip_weight(name, local_expert_ids):
++                if not should_skip_weight(name, local_expert_ids) and not _dsv41_skip_file(name, st_file):
+                     yield name, param
+         elif safetensors_load_strategy == "torchao":
+             # we can't load flattened torchao tensor subclasses directly into the model
+@@ -944,9 +990,9 @@
              with safe_open(st_file, framework="pt") as f:
                  state_dict = {}
                  for name in f.keys():  # noqa: SIM118
 -                    if should_skip_weight(name, local_expert_ids):
-+                    if should_skip_weight(name, local_expert_ids) or _dsv41_skip(name):
++                    if should_skip_weight(name, local_expert_ids) or _dsv41_skip(name) or _dsv41_skip_file(name, st_file):
                          continue
 -                    state_dict[name] = f.get_tensor(name)
 +                    state_dict[name] = _dsv41_get_tensor(f, name)
  
                  # update with leftover tensor data from previous iteration, if any
                  state_dict.update(leftover_state_dict)
-@@ -962,9 +988,9 @@
+@@ -962,9 +1008,9 @@
          else:
              with safe_open(st_file, framework="pt") as f:
                  for name in f.keys():  # noqa: SIM118
 -                    if should_skip_weight(name, local_expert_ids):
-+                    if should_skip_weight(name, local_expert_ids) or _dsv41_skip(name):
++                    if should_skip_weight(name, local_expert_ids) or _dsv41_skip(name) or _dsv41_skip_file(name, st_file):
                          continue
 -                    param = f.get_tensor(name)
 +                    param = _dsv41_get_tensor(f, name)
@@ -1168,7 +1197,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          )
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/nvidia/model.py vllm/models/deepseek_v4_1/nvidia/model.py
 --- image-official/models/deepseek_v4_1/nvidia/model.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/models/deepseek_v4_1/nvidia/model.py	2026-10-17 18:46:52.546332934 -0700
++++ vllm/models/deepseek_v4_1/nvidia/model.py	2026-10-18 06:25:10.086659455 -0700
 @@ -24,6 +24,29 @@
      mhc_pre_delayed_tilelang,
  )
@@ -1409,7 +1438,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          # (compressor kv_score, indexer.weights_proj). fused_wqa_wkv stays on
          # the default stream.
          aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
-+        if _dsv41_os.environ.get("DSV41_EXL3") == "1":  # dsv41 exl3 streams: exllamav3 kernels share one lock buffer
++        if _dsv41_os.environ.get("DSV41_EXL3") == "1" and _dsv41_os.environ.get("DSV41_EXL3_DENSE", "1") == "1":  # dsv41 exl3 streams: exllamav3 kernels share one lock buffer
 +            aux_stream_list = None
  
          # Reserved topk indices buffer for all Indexer layers to reuse.
