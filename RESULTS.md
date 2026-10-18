@@ -236,9 +236,19 @@ Quality (paired with the earlier rows of this file):
 | wikitext-2 perplexity | 2.7147 | 2.7530 | 2.8512 | 2.8200 (−1.09% vs the pack, per-window nll −0.0110 ± 0.0046; +2.4% vs MXFP4 1017) |
 | MMLU-1000 | 84.4% | – | 83.2% | 84.0% (vs base p = 0.70; vs the pack p = 0.23) |
 | GSM8K-200 | – | – | 197/200 (778 s) | 196/200 (568 s; one item differs, #119 truncated in both) |
+| Python stdlib code perplexity | 1.3633 | – | 1.3775 | 1.3753 (+0.9% vs base, per-window nll +0.0084 ± 0.0056) |
+| HumanEval+ pass@1 | 154/164 = 93.9% | – | 152/164 = 92.7% | 153/164 = 93.3% (vs base p = 1.00; vs the pack p = 1.00) |
+| MBPP+ pass@1 | 321/378 = 84.9% | – | 319/378 = 84.4% | 321/378 = 84.9% (vs base p = 1.00; vs the pack p = 0.73) |
 | needle, 28k tokens | – | – | recalled | recalled (also under a mixed 8-request load) |
+| GPQA-Diamond (198, glm53-run prompt: greedy, 65,536-token budget, 6 concurrent) | – | – | – | 172/198 = 86.9% (12 hit the budget, all scored wrong; 8.5k tokens per item; GLM53UM 157/198 = 79.3%, paired p = 0.008) |
 
 The hybrid is also abliterated, which the pure pack was not (its dense weights came from the original 1017).
+
+The same benchmarks also show the DSpark speedup on reasoning-heavy batches of 6-8 requests: HumanEval+ generation
+10 min (pure pack with n-gram: 22), MBPP+ 19 min (38), GSM8K-200 568 s (778).
+
+The same benchmarks also show the DSpark speedup on reasoning-heavy batches of 6-8 requests: HumanEval+ generation
+10 min (pure pack with n-gram: 22), MBPP+ 19 min (38), GSM8K-200 568 s (778).
 
 ## Memory
 

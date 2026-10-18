@@ -75,11 +75,26 @@ def main():
             return
     t0 = time.time()
     done = []
+    # DSV41_CACHE=<file.jsonl>: finished generations are appended as they complete and reused on a rerun, so an
+    # interrupted run (e.g. stopped to make room for live traffic) resumes where it was.
+    cache_path = os.environ.get("DSV41_CACHE")
+    if cache_path and os.path.exists(cache_path):
+        cached = {}
+        for line in open(cache_path):
+            if line.strip():
+                d = json.loads(line); cached[str(d["task_id"])] = d
+        done = [cached[str(r["task_id"])] for r in rows if str(r["task_id"]) in cached]
+        rows = [r for r in rows if str(r["task_id"]) not in cached]
+        print(f"resuming: {len(done)} cached, {len(rows)} to generate", flush=True)
+    cache = open(cache_path, "a") if cache_path else None
     with cf.ThreadPoolExecutor(conc) as ex:
         futs = {ex.submit(generate, url, r, bench, max_tokens): r["task_id"] for r in rows}
         for k, f in enumerate(cf.as_completed(futs)):
             try:
-                done.append(f.result())
+                d = f.result()
+                done.append(d)
+                if cache:
+                    cache.write(json.dumps(d) + "\n"); cache.flush()
             except Exception as e:
                 done.append({"task_id": futs[f], "code": "", "error": str(e)[:200]})
             if (k + 1) % 25 == 0 or k + 1 == len(rows):
