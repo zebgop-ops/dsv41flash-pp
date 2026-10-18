@@ -153,6 +153,40 @@ abliteration edit are not separable here). Code perplexity, MMLU-1000 and HumanE
 interrupted when the GPUs were needed elsewhere and are pending (`tools/eval-1017.sh`,
 `tools/eval-1017-code.sh` resume them against a running server).
 
+### DeepSeek-V4.1-Flash-1017 EXL3 2.9 bpw, every expert on the GPUs (`serve/run-dsv41-exl3-pp4.sh`, :8008)
+
+`LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw` through exllamav3 1.6.3 kernels built for sm_80
+(FINDINGS §11): routed experts K=3 (layers 18-22 K=2) in the fused trellis MoE kernel, attention /
+shared experts / compressor / indexer / head as EXL3 linears, Engram tables from the MXFP4 1017
+snapshot. Partition 10,10,10,10, no CPU experts, utilization 0.91, 262,144-token window, n-gram K=3,
+`FULL_AND_PIECEWISE` graphs. Same prompts as above, streaming with thinking off unless noted.
+
+| workload | MXFP4 1017, 12 CPU layers | EXL3 1017, all-GPU | REAP-272E, n-gram (reference) |
+|---|---|---|---|
+| free prose, 400 tokens streaming | 30.6 s (13.1 tok/s) | 24.0 s (16.7 tok/s, 64 ms/step) | 12.7-14.2 s (28-31 tok/s) |
+| code edit, 529-token prompt, 400 tokens streaming | 27.2 s | 12.0 s (123 steps, 97% drafts accepted) | 6.0 s |
+| specbench prose / code-edit (thinking on, incl. prefill) | 12.7 / 13.2 tok/s | 12.5 / 25.6 tok/s | 28.3 / 43.3 tok/s |
+| prefill 1.5k / 6k / 12k-token prompts | ~180-200 tok/s | 0.5k / 1.1k / 0.8k tok/s (measured beside an MMLU run) | 2.4k / 3.1k tok/s |
+| KV pool | 4.26M tokens at 262k | 4.39M tokens at 262k | 4.7M at 131k |
+| GPU used per rank while serving | 56.3 / 57.7 / 57.1 / 60.1 GiB (util 0.93) | 58.2 / 53.5 / 52.3 / 58.4 GiB (util 0.91) | up to 59 GiB (util 0.93) |
+| host RAM | 99 GB | ~16 GB | ~16 GB |
+| load to first request | ~7 min (CPU expert repack) | ~2.5 min (weights 70 s, graphs 3 s) | ~3 min |
+| greedy code-edit output vs the MXFP4 1017 | – | identical (prose diverges at char 124) | identical to base |
+
+Quality, same harness and inputs as the other rows of this file (`tools/quality.py`, paired per window):
+
+| metric | 0909 base | MXFP4 1017 | EXL3 1017 | REAP-272E (0909) |
+|---|---|---|---|---|
+| wikitext-2 perplexity (67,131 tokens, 36 windows) | 2.7147 | 2.7530 (+1.4% vs base) | 2.8503 (+3.5% vs MXFP4 1017, per-window nll +0.035 ± 0.007) | 3.4821 (+28.3%) |
+| Python stdlib code perplexity (30,589 tokens, 16 windows) | 1.3633 | not measured | 1.3775 (+1.0% vs base, +0.010 ± 0.006) | 1.3642 |
+| MMLU-1000 (same questions, cloze) | 84.4% | not measured (interrupted) | 83.6% (−0.8 pts; McNemar p = 0.37, 927/1000 same answers, margin 3.40 → 2.92 nats) | 76.7% (p < 1e-4) |
+| HumanEval+ / MBPP+ pass@1 | 93.9% / 84.9% | – | running (`tools/eval-1017-code.sh exl3`) | 93.9% / 83.3% |
+
+The pack's card reports +0.4% prose / +1.8% code perplexity on its own held-out sets; on wikitext the
+3-bit trellis costs +3.5% here, an order of magnitude less than REAP's expert pruning (+28%), and the
+MMLU difference to the unquantized 0909 base is not significant over 1000 paired questions (REAP's −7.7
+points was, at p < 1e-4).
+
 ## Memory
 
 | rank | layers | GPU weights + non-torch | KV pool |

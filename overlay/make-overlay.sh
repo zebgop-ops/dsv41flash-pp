@@ -58,6 +58,8 @@ FILES=(
   utils/deep_gemm.py
   tokenizers/deepseek_v41_encoding.py
   tokenizers/deepseek_v41.py
+  config/model.py
+  model_executor/layers/quantization/__init__.py
 )
 CID=$(docker create "$IMG")
 trap 'docker rm "$CID" >/dev/null' EXIT

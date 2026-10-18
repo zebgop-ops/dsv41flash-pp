@@ -638,6 +638,12 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.
+        if getattr(self.wo_a, "weight", None) is None:  # dsv41 exl3: packed wo_a, one matrix per o-group
+            from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _fused_inverse_rope_gptj
+            o_ref = _fused_inverse_rope_gptj(o, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
+            o_ref = o_ref.view(o.shape[0], self.n_local_groups, -1)
+            z = self.wo_a.quant_method.apply(self.wo_a, o_ref)
+            return self.wo_b(z.flatten(1))
         z = rocm_inv_rope_einsum(
             self.rotary_emb,
             o,

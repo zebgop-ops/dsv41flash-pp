@@ -10,3 +10,8 @@ kt/site/
 kt/wheel/
 eval/*
 !eval/README.md
+exl3/wheel*/
+exl3/site*/
+exl3/src/
+exl3/tune-cache/
+q3/*.log

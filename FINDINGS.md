@@ -311,6 +311,66 @@ wrapper therefore puts layer 7 (the last of rank 0) on the CPU as well and halve
 (1024 tokens; the eager-prefill activation peak is what the profiler reserves). The measured
 per-rank numbers and the resulting speed are in RESULTS.md.
 
+## 11. EXL3 experts and linears on sm_80: 3-bit weights, two deadlocks, one autotuner
+
+The lossless speed ceiling of the unpruned model is set by the cold layers' experts on the CPU
+(§5, §10); the only ways past it change the weights. REAP prunes experts (§9, −7.7 MMLU points);
+re-quantizing to 3 bits keeps every expert. A home-made INT3 would not do: on real layer-20 experts
+an asymmetric INT3 at the only group size that fits (g128, 3.15 bpw) perturbs each expert's output by
+~40% RMS, three times what INT4 would add (`q3/int3study.py`). ExLlamaV3's trellis quantization is
+the state of the art at 3 bits, and `LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw` exists: routed
+experts at K=3 (layers 18-22 at 2), attention / shared experts / compressor / indexer at 5, indexer
+`wk` 8, head 6, calibrated on 250 rows of exllamav3's default mix, and card-measured at +0.4% prose /
++1.8% code perplexity against the unquantized 1017. 196 GiB, so all 40 layers' experts fit the four
+cards (4.75 GiB per layer, REAP's footprint) with a 10,10,10,10 partition and no CPU experts.
+
+**Stack.** exllamav3 v1.6.3 compiled for sm_80 inside the 0909 image (`exl3/build-exllamav3.sh`;
+its GEMM kernel has `__CUDA_ARCH__ > 890` branches with Ampere fallbacks). `overlay/exl3/dsv41_exl3.py`
+is a port of Mia'a AI Lab's EXL3 overlay for the same image (their GB10 kit): `Exl3Config` registered
+as `--quantization exl3`; `Exl3MoEMethod` keeps the experts packed (`w13_*`/`w2_*` trellis, suh, svh,
+mul1 marker) and runs them through `exllamav3_ext.exl3_moe` (the fused trellis MoE kernel, 1.6.x ABI:
+float K, `num_active`, deterministic scratch off, 16-row tiles; experts above 128 rows in a prefill chunk
+take 128-row tiles of the same kernel); `Exl3LinearMethod` makes every packed dense matrix a
+`LinearEXL3` (merged linears keep one per shard, `wo_a` one per o-group from `wo_a.slice.i.*`).
+`patch_exl3.py` wires the registry and override order, the packed `head.*` names, the slice loader,
+the compressor and indexer quant configs, and an EXL3 branch in the Ampere o-projection (inverse RoPE,
+then the grouped EXL3 `wo_a`, instead of the bf16 einsum). The pack has no Engram tables; the SSD row
+store reads them from the 1017 MXFP4 snapshot (`DSV41_ENGRAM_MODEL_DIR`; its shards 47/48 are
+byte-identical to the official 1017's). Everything loads in ~70 s; the model answered correctly on the
+first boot that got past warmup.
+
+**Deadlock 1: one lock buffer, many streams.** The first graph-mode boots hung in the CUDA-graph
+warmup with the two Engram ranks at 100% GPU while ranks 2 and 3 finished; eager mode and
+`CUDA_LAUNCH_BLOCKING=1` both served fine. Ruled out: SM co-residency of the fused kernel's spinning
+group barriers (`EXL3_MOE_NUM_ACTIVE=1` leaves 38 of 70 SMs free and still hung; all four cards have
+70 SMs), the Engram SSD host callback (`DSV41_ENGRAM_ZERO=1` still hung), the Engram hash kernel's
+binary search (converges on any data). The cause is in exllamav3: `exl3_gemm` (split-K reductions)
+and `exl3_moe` (group barriers) both take `DevCtx::get_locks(device)`, one lock array per device,
+which is safe in exllamav3's single-stream engine. This model forks EXL3 linears onto side streams:
+the attention input projections (the compressor's kv-score, an EXL3 `fused_wkv_wgate`, on aux
+stream 0) and vLLM's shared-experts stream, where the EXL3 shared-expert GEMMs run concurrently with
+`exl3_moe`. Two EXL3 kernels on different streams corrupt the shared locks and spin forever; the
+Engram ranks add one more concurrent projection and lost the race first. Fix: no aux streams and
+`VLLM_DISABLE_SHARED_EXPERTS_STREAM=1` whenever the EXL3 pack is active (patch `dsv41 exl3 streams`).
+The overlap it gives up is two small GEMMs per layer.
+
+**Autotune inside capture.** `exl3_gemm` autotunes its cooperative kernel configuration per (rows,
+k, n, K, ...) the first time it sees a shape, with timed launches and event syncs; inside a CUDA-graph
+capture that is `operation not permitted when stream is capturing` (`coop_autotune.cu`). vLLM's
+eager warmup covers most shapes before capture, but not all paths (the PP shadow layers' indexer
+`wq_b` reached capture untuned once). Two measures: every dense `LinearEXL3` is run at rows
+1,2,3,4,6,8,12,16 right after load (`EXL3_PRETUNE_ROWS`; the capture sizes), and exllamav3's tuning
+cache persists on the host (`EXLLAMAV3_TUNE_CACHE` → `exl3/tune-cache/coop_autotune_v1.bin`), so
+later boots start tuned.
+
+**Per-expert Python loop is not graph-safe.** `EXL3_FUSED_MOE=0` (unique-expert `LinearEXL3`
+loop) needs host syncs (`torch.unique(...).tolist()`) and fails capture with
+`cudaErrorStreamCaptureInvalidated`; it remains a correctness reference for eager runs only.
+
+**Memory at utilization 0.91.** 58.2 / 53.5 / 52.3 / 58.4 GiB per rank serving, KV pool 4.39M tokens
+at a 262,144-token window (0.93 put ranks 0 and 3 at 60.1-60.5 GiB, too close to the 61-63 GiB where
+cards have crashed). Numbers in RESULTS.md.
+
 ## Diagnostic switches (all off by default)
 
 | switch | effect |

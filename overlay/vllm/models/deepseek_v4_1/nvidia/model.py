@@ -599,6 +599,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (compressor kv_score, indexer.weights_proj). fused_wqa_wkv stays on
         # the default stream.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        if _dsv41_os.environ.get("DSV41_EXL3") == "1":  # dsv41 exl3 streams: exllamav3 kernels share one lock buffer
+            aux_stream_list = None
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
@@ -1031,6 +1033,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # Vision weights are loaded by the outer multimodal wrapper.
                 logger.warning_once("Skipping non-text weight: %s", name)
                 continue
+            # dsv41 exl3: wo_a is packed per o-group as wo_a.slice.{i}.{trellis,suh,svh,mul1}
+            _sl = re.search(r"\.slice\.(\d+)\.(trellis|suh|svh|mul1|mcg)$", name)
+            if _sl:
+                _mapped = name[: _sl.start()] + "." + _sl.group(2)
+                if is_pp_missing_parameter(_mapped, self):
+                    continue
+                if _mapped not in params_dict:
+                    _h, _, _l = _mapped.rpartition(".")
+                    if f"{_h}.base_layer.{_l}" in params_dict:
+                        _mapped = f"{_h}.base_layer.{_l}"
+                _param = params_dict[_mapped]
+                _param.weight_loader(_param, loaded_weight, int(_sl.group(1)))
+                loaded_params.add(_mapped)
+                continue
             if pad_shared_expert and ".shared_experts." in name:
                 loaded_weight = self._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
@@ -1238,6 +1254,11 @@ def _make_deepseek_v4_weights_mapper(
         orig_to_new_regex=scale_regex,
         orig_to_new_suffix={
             "head.weight": "lm_head.weight",
+            "head.trellis": "lm_head.trellis",  # dsv41 exl3
+            "head.suh": "lm_head.suh",
+            "head.svh": "lm_head.svh",
+            "head.mul1": "lm_head.mul1",
+            "head.mcg": "lm_head.mcg",
             "embed.weight": "embed_tokens.weight",
             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
         },
@@ -1329,6 +1350,7 @@ class DeepseekV41LLMForCausalLM(
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
+                quant_config=vllm_config.quant_config,  # dsv41 exl3: packed head
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
         else:

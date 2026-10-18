@@ -6,8 +6,8 @@ set -u
 tag=${1:-1017}; URL=http://localhost:${DSV41_PORT:-8007}
 export DSV41_MODEL=${DSV41_MODEL:-DSv41Flash1017}
 cd /home/r/dsv41-run
-until grep -q "== 1017 done\|server never came up\|container .* is gone" eval-1017-run.log 2>/dev/null; do sleep 30; done
-grep -q "== 1017 done" eval-1017-run.log || { echo "eval-1017.sh did not finish cleanly"; exit 1; }
+until grep -q "== $tag done\|server never came up\|container .* is gone" "eval-$tag-run.log" 2>/dev/null; do sleep 30; done
+grep -q "== $tag done" "eval-$tag-run.log" || { echo "eval-1017.sh did not finish cleanly"; exit 1; }
 for b in humanevalplus mbppplus; do
   echo "== $b generate $(date -u +%T)"
   timeout 14400 python3 tools/codeeval.py "$URL" $b "eval/gen-$tag-$b.json" 0 8 4096 2>&1 | tail -1

@@ -60,7 +60,8 @@ drafter, FINDINGS.md §8), `DSV41_CG` (`FULL_DECODE_ONLY` without speculation,
 `FULL_AND_PIECEWISE` with it; `NONE` for diagnostics), `DSV41_GPUS`, `DSV41_EXTRA_ARGS`,
 `DSV41_EXTRA_DOCKER` (e.g. `"-e CUDA_LAUNCH_BLOCKING=1"`), `DSV41_HF_REPO` (another checkpoint
 in the same cache; `serve/run-dsv41reap-pp4.sh` wraps it for the REAP-272E model on :8005,
-`serve/run-dsv41-1017-pp4.sh` for the 2026-10-17 weights refresh on :8007, FINDINGS.md §10), and
+`serve/run-dsv41-1017-pp4.sh` for the 2026-10-17 weights refresh on :8007, FINDINGS.md §10;
+`serve/run-dsv41-exl3-pp4.sh` for its EXL3 2.9 bpw pack with every expert on the GPUs, :8008, FINDINGS.md §11), and
 the diagnostic switches in [FINDINGS.md](FINDINGS.md). It pre-flights the checkpoint, the
 driver (kernel module vs userland mismatch after an upgrade), other servers on the cards,
 and CUDA init on every GPU before touching anything.
@@ -150,19 +151,28 @@ that produced it.
 serve/run-dsv41-pp4.sh   production launcher (preflight, mounts, all flags); run-dsv41reap-pp4.sh wraps it for
                          the REAP-272E checkpoint (link-reap-engram.sh links the base Engram shards in),
                          run-dsv41-1017-pp4.sh for the 2026-10-17 checkpoint (util 0.93 layout, FINDINGS.md §10)
+                         run-dsv41-exl3-pp4.sh for the 1017 EXL3 2.9 bpw pack (all experts on the GPUs, FINDINGS.md §11)
+overlay/exl3/            dsv41_exl3.py: EXL3 (ExLlamaV3 trellis) routed experts + dense linears for this image
+                         (ported from Mia'a AI Lab's GB10 overlay; one stream for every exllamav3 kernel)
+exl3/                    build-exllamav3.sh builds exllamav3 1.6.3's CUDA extension for sm_80 inside the image
+                         (wheel/, site/, src/, tune-cache/ are local: not in the repo)
+q3/int3study.py          INT3 vs MXFP4 error study on real experts (why plain INT3 was not worth building)
 overlay/vllm/            the Python overlay, mounted over the image's vllm package
 overlay/patch_*.py       anchor-based, idempotent patch scripts; apply-overlay.sh runs them all
                          (spec decode under PP: patch_v1_spec_pp, patch_pp_spec_tokens, patch_engram_piecewise,
                          patch_prefill_eager, patch_pad_mask, patch_full_q1 — FINDINGS.md §7)
                          (patch_encoding_1017: DeepSeek's reference chat encoding incl. the reasoning-effort
                          budgets; patch_engram_stage_entry: Engram on a PP stage's first layer — FINDINGS.md §10)
+                         (patch_exl3: registry, packed head/wo_a names, compressor + indexer quant config,
+                         EXL3 o-projection, single-stream model — FINDINGS.md §11)
 overlay/make-overlay.sh  extracts pristine files from the image (for diffing / re-seeding)
 overlay/engram_ssd/      row_store.cpp + build.sh, engram_ssd.py, CPU/GPU tests
 overlay/hybrid/          cpu_experts.py, cpu_moe.cpp/.py (native CPU MoE), marlin_staged.py,
                          pp_shadow.py (PP shadow sources), build.sh, tests
 overlay/sm80-src/        the V4 Ampere files (haosdent/vllm@f8ea5bb) the port was regexed from
 patches/vllm-overlay.diff  full delta vs the pristine image
-ktests/                  kernel tests and the torch oracles (ref_layer0*.py, ref_stages.py); test_encoding_1017.py
+ktests/                  kernel tests and the torch oracles (ref_layer0*.py, ref_stages.py); test_exl3_linear_rows.py
+                         (exl3_gemm vs reconstructed reference per captured row count); test_encoding_1017.py
                          replays DeepSeek's golden chat-encoding fixtures through vLLM's tokenizer wrapper
 kt/                      kt-kernel MXFP4 correctness/perf tests (wheel and site dir not included)
 tools/                   smoke.py, plen.py, needle.py, bench.py, soak.py (+ detect.py);

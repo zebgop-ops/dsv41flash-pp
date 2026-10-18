@@ -61,6 +61,8 @@ class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
         # einsum path multiplies by weight_scale_inv when present, so drop a
         # leftover scale once the weight is already bf16.
         wo_a = self.wo_a
+        if getattr(wo_a, "weight", None) is None:  # dsv41 exl3: packed wo_a has no dense weight
+            return super()._o_proj(o, positions)
         if not getattr(self, "_dsv41_wo_a_checked", False):
             assert wo_a.weight.element_size() >= 2, (
                 "wo_a is still 1-byte MXFP8 on SM8x; expected the emulation "

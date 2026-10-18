@@ -772,9 +772,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
+                _lin = compressor.fused_wkv_wgate
+                if getattr(_lin, "weight", None) is None:  # dsv41 exl3: packed, no dense weight
+                    return _lin.quant_method.apply(_lin, hidden_states).float()
                 return torch.mm(
                     hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
+                    _lin.weight.T,
                     out_dtype=torch.float32,
                 )
 
@@ -1098,7 +1101,7 @@ class DeepseekV4Indexer(nn.Module):
                 main_head_dim,
                 self.head_dim,
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config,  # dsv41 exl3: packed K=8 in EXL3 packs
                 prefix=f"{prefix}.wk",
             )
             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)

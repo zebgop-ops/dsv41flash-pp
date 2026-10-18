@@ -1,3 +1,23 @@
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/config/model.py vllm/config/model.py
+--- image-official/config/model.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/config/model.py	2026-10-17 17:35:44.301138247 -0700
+@@ -1269,6 +1269,7 @@
+             # `override_quantization_method` method) must be checked in order
+             # of preference (this is particularly important for GPTQ).
+             overrides = [
++                "exl3",  # dsv41 exl3 overlay
+                 "auto_gptq",
+                 "gptq",
+                 "gptq_marlin",
+@@ -1292,6 +1293,8 @@
+             # if the user specifies humming, we should always use humming
+             if self.quantization == "humming":
+                 overrides = ["humming"] + overrides
++            if quant_method == "exl3":  # dsv41 exl3 overlay: make sure the class is registered
++                import dsv41_exl3  # noqa: F401
+             quantization_methods = [
+                 q for q in supported_quantization if q not in overrides
+             ]
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/config/speculative.py vllm/config/speculative.py
 --- image-official/config/speculative.py	2026-09-09 23:38:04.000000000 -0700
 +++ vllm/config/speculative.py	2026-09-11 14:20:26.513954716 -0700
@@ -87,6 +107,26 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_e
          and gating_output.is_contiguous()
          and correction_bias is not None
          and correction_bias.dtype == torch.float32
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/layers/quantization/__init__.py vllm/model_executor/layers/quantization/__init__.py
+--- image-official/model_executor/layers/quantization/__init__.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/model_executor/layers/quantization/__init__.py	2026-10-17 17:35:44.300442950 -0700
+@@ -10,6 +10,7 @@
+ logger = init_logger(__name__)
+ 
+ QuantizationMethods = Literal[
++    "exl3",  # dsv41 exl3 overlay
+     "awq",
+     "auto_awq",
+     "fp8",
+@@ -187,6 +188,8 @@
+     for shorthand in _ONLINE_SHORTHANDS:
+         method_to_config.setdefault(shorthand, OnlineQuantizationConfig)
+ 
++    if quantization == "exl3" and "exl3" not in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG:
++        import dsv41_exl3  # noqa: F401  dsv41 exl3 overlay: registers Exl3Config
+     # Update the `method_to_config` with customized quantization methods.
+     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
+ 
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/layers/quantization/mxfp4.py vllm/model_executor/layers/quantization/mxfp4.py
 --- image-official/model_executor/layers/quantization/mxfp4.py	2026-09-09 23:38:04.000000000 -0700
 +++ vllm/model_executor/layers/quantization/mxfp4.py	2026-09-11 01:26:51.474956808 -0700
@@ -623,10 +663,26 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
              shared_experts=self.shared_experts,
              gate=self.gate,
              num_experts=self.n_routed_experts,
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/amd/rocm.py vllm/models/deepseek_v4_1/amd/rocm.py
+--- image-official/models/deepseek_v4_1/amd/rocm.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4_1/amd/rocm.py	2026-10-17 17:35:44.303097168 -0700
+@@ -638,6 +638,12 @@
+ 
+     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+         # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.
++        if getattr(self.wo_a, "weight", None) is None:  # dsv41 exl3: packed wo_a, one matrix per o-group
++            from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _fused_inverse_rope_gptj
++            o_ref = _fused_inverse_rope_gptj(o, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
++            o_ref = o_ref.view(o.shape[0], self.n_local_groups, -1)
++            z = self.wo_a.quant_method.apply(self.wo_a, o_ref)
++            return self.wo_b(z.flatten(1))
+         z = rocm_inv_rope_einsum(
+             self.rotary_emb,
+             o,
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/ampere/ampere_sparse.py vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
 --- image-official/models/deepseek_v4_1/ampere/ampere_sparse.py	1969-12-31 16:00:00.000000000 -0800
-+++ vllm/models/deepseek_v4_1/ampere/ampere_sparse.py	2026-09-10 22:28:04.866906594 -0700
-@@ -0,0 +1,181 @@
++++ vllm/models/deepseek_v4_1/ampere/ampere_sparse.py	2026-10-17 17:35:44.303339317 -0700
+@@ -0,0 +1,183 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""DeepSeek V4.1 sparse MLA attention for SM8x (Ampere: A100 / CMP 170HX).
@@ -690,6 +746,8 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
 +        # einsum path multiplies by weight_scale_inv when present, so drop a
 +        # leftover scale once the weight is already bf16.
 +        wo_a = self.wo_a
++        if getattr(wo_a, "weight", None) is None:  # dsv41 exl3: packed wo_a has no dense weight
++            return super()._o_proj(o, positions)
 +        if not getattr(self, "_dsv41_wo_a_checked", False):
 +            assert wo_a.weight.element_size() >= 2, (
 +                "wo_a is still 1-byte MXFP8 on SM8x; expected the emulation "
@@ -816,8 +874,31 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/attention.py vllm/models/deepseek_v4_1/attention.py
 --- image-official/models/deepseek_v4_1/attention.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/models/deepseek_v4_1/attention.py	2026-09-10 16:12:53.075026052 -0700
-@@ -1115,6 +1115,7 @@
++++ vllm/models/deepseek_v4_1/attention.py	2026-10-17 17:35:44.302724702 -0700
+@@ -772,9 +772,12 @@
+             compressor = self.compressor
+ 
+             def compressor_kv_score() -> torch.Tensor:
++                _lin = compressor.fused_wkv_wgate
++                if getattr(_lin, "weight", None) is None:  # dsv41 exl3: packed, no dense weight
++                    return _lin.quant_method.apply(_lin, hidden_states).float()
+                 return torch.mm(
+                     hidden_states,
+-                    compressor.fused_wkv_wgate.weight.T,
++                    _lin.weight.T,
+                     out_dtype=torch.float32,
+                 )
+ 
+@@ -1098,7 +1101,7 @@
+                 main_head_dim,
+                 self.head_dim,
+                 bias=False,
+-                quant_config=None,
++                quant_config=quant_config,  # dsv41 exl3: packed K=8 in EXL3 packs
+                 prefix=f"{prefix}.wk",
+             )
+             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+@@ -1115,6 +1118,7 @@
              self.topk_indices_buffer,
              skip_k_cache_insert=True,
              use_fp4_cache=self.use_fp4_kv,
@@ -1073,9 +1154,21 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          if SHUFFLE:
              tiled = (
                  block // HEAD_TILE_SIZE * BLOCK_TILE_SIZE * HEAD_TILE_SIZE
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/compressor.py vllm/models/deepseek_v4_1/compressor.py
+--- image-official/models/deepseek_v4_1/compressor.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4_1/compressor.py	2026-10-17 17:35:44.302197764 -0700
+@@ -221,7 +221,7 @@
+             wkv_wgate_sizes,
+             bias=False,
+             return_bias=False,
+-            quant_config=None,
++            quant_config=vllm_config.quant_config,  # dsv41 exl3: packed in EXL3 packs
+             disable_tp=True,
+             prefix=f"{prefix}.fused_wkv_wgate",
+         )
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/nvidia/model.py vllm/models/deepseek_v4_1/nvidia/model.py
 --- image-official/models/deepseek_v4_1/nvidia/model.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/models/deepseek_v4_1/nvidia/model.py	2026-10-17 15:23:07.161920040 -0700
++++ vllm/models/deepseek_v4_1/nvidia/model.py	2026-10-17 18:46:52.546332934 -0700
 @@ -24,6 +24,29 @@
      mhc_pre_delayed_tilelang,
  )
@@ -1312,7 +1405,16 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          return x, residual, post_mix, res_mix, ffn_pre
  
  
-@@ -454,6 +634,28 @@
+@@ -419,6 +599,8 @@
+         # (compressor kv_score, indexer.weights_proj). fused_wqa_wkv stays on
+         # the default stream.
+         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
++        if _dsv41_os.environ.get("DSV41_EXL3") == "1":  # dsv41 exl3 streams: exllamav3 kernels share one lock buffer
++            aux_stream_list = None
+ 
+         # Reserved topk indices buffer for all Indexer layers to reuse.
+         self.topk_indices_buffer = torch.empty(
+@@ -454,6 +636,28 @@
  
          self.engram_layout = EngramLayout.from_config(config)
  
@@ -1341,7 +1443,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          self.start_layer, self.end_layer, self.layers = make_layers(
              config.num_hidden_layers,
              lambda prefix: DeepseekV4DecoderLayer(
-@@ -467,6 +669,13 @@
+@@ -467,6 +671,13 @@
              prefix=f"{prefix}.layers",
          )
  
@@ -1355,7 +1457,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          # The n-gram hash needs a slot-keyed rolling store of compressed ids
          # (chunked prefill / decode lookback); key it off the first local
          # layer's sliding-window KV cache. Only PP ranks owning an engram
-@@ -521,20 +730,29 @@
+@@ -521,20 +732,29 @@
          # layer and keeps that shape until the final hc collapse — plus the
          # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
          # for its attention collapse.
@@ -1399,7 +1501,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
  
      def forward(
          self,
-@@ -543,6 +761,7 @@
+@@ -543,6 +763,7 @@
          intermediate_tensors: IntermediateTensors | None,
          inputs_embeds: torch.Tensor | None = None,
          lookback_token_ids: torch.Tensor | None = None,
@@ -1407,7 +1509,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
      ) -> torch.Tensor | IntermediateTensors:
          if get_pp_group().is_first_rank:
              if inputs_embeds is not None:
-@@ -570,11 +789,31 @@
+@@ -570,11 +791,31 @@
              attn_metadata = get_forward_context().attn_metadata
              if isinstance(attn_metadata, list):
                  attn_metadata = attn_metadata[dbo_current_ubatch_id()]
@@ -1443,7 +1545,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
                  # Image-span tokens are dead: they break n-grams (hash op
                  # takes True=dead) and their gate is zeroed (Engram.forward
                  # takes True=keep).
-@@ -586,19 +825,19 @@
+@@ -586,19 +827,19 @@
                              "engram needs `lookback_token_ids` from the model "
                              "runner (the DBO/ubatch wrapper drops model kwargs)"
                          )
@@ -1467,7 +1569,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
                  )
              elif get_engram_dp_size() > 1:
                  # The lookup is collective once DP replicas share a table, so
-@@ -630,12 +869,26 @@
+@@ -630,12 +871,26 @@
          if not get_pp_group().is_first_rank:
              assert intermediate_tensors is not None
              pre_mix = intermediate_tensors["pre_mix"]
@@ -1494,7 +1596,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
              hidden_states, residual, post_mix, res_mix, pre_mix = layer(
                  hidden_states,
                  positions,
-@@ -647,6 +900,40 @@
+@@ -647,6 +902,40 @@
                  engram_hashes,
                  engram_mask,
              )
@@ -1535,7 +1637,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
              if idx + 1 in self.aux_hidden_state_layers:
                  # Reconstruct the aux hidden state for draft models
                  aux_recon = mhc_post_tilelang(
-@@ -667,9 +954,20 @@
+@@ -667,9 +956,20 @@
                  )
  
          if not get_pp_group().is_last_rank:
@@ -1559,7 +1661,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
  
          # MTP needs full HC states; otherwise collapse and normalize locally
          # before gathering to reduce communication.
-@@ -726,6 +1024,9 @@
+@@ -726,10 +1026,27 @@
          )
  
          for name, loaded_weight in weights:
@@ -1569,7 +1671,45 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
              if name.startswith(("vision.", "aligner.", "image_")):
                  # Vision weights are loaded by the outer multimodal wrapper.
                  logger.warning_once("Skipping non-text weight: %s", name)
-@@ -1038,6 +1339,7 @@
+                 continue
++            # dsv41 exl3: wo_a is packed per o-group as wo_a.slice.{i}.{trellis,suh,svh,mul1}
++            _sl = re.search(r"\.slice\.(\d+)\.(trellis|suh|svh|mul1|mcg)$", name)
++            if _sl:
++                _mapped = name[: _sl.start()] + "." + _sl.group(2)
++                if is_pp_missing_parameter(_mapped, self):
++                    continue
++                if _mapped not in params_dict:
++                    _h, _, _l = _mapped.rpartition(".")
++                    if f"{_h}.base_layer.{_l}" in params_dict:
++                        _mapped = f"{_h}.base_layer.{_l}"
++                _param = params_dict[_mapped]
++                _param.weight_loader(_param, loaded_weight, int(_sl.group(1)))
++                loaded_params.add(_mapped)
++                continue
+             if pad_shared_expert and ".shared_experts." in name:
+                 loaded_weight = self._pad_shared_expert_weight(
+                     self.quant_config, name, loaded_weight
+@@ -937,6 +1254,11 @@
+         orig_to_new_regex=scale_regex,
+         orig_to_new_suffix={
+             "head.weight": "lm_head.weight",
++            "head.trellis": "lm_head.trellis",  # dsv41 exl3
++            "head.suh": "lm_head.suh",
++            "head.svh": "lm_head.svh",
++            "head.mul1": "lm_head.mul1",
++            "head.mcg": "lm_head.mcg",
+             "embed.weight": "embed_tokens.weight",
+             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
+         },
+@@ -1028,6 +1350,7 @@
+             self.lm_head = ParallelLMHead(
+                 config.vocab_size,
+                 config.hidden_size,
++                quant_config=vllm_config.quant_config,  # dsv41 exl3: packed head
+                 prefix=maybe_prefix(prefix, "lm_head"),
+             )
+         else:
+@@ -1038,6 +1361,7 @@
          )
  
          self.set_moe_parameters()
@@ -1577,7 +1717,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
  
      def set_moe_parameters(self) -> None:
          self.num_expert_groups = getattr(self.config, "n_group", 1)
-@@ -1094,6 +1396,7 @@
+@@ -1094,6 +1418,7 @@
          intermediate_tensors: IntermediateTensors | None = None,
          inputs_embeds: torch.Tensor | None = None,
          lookback_token_ids: torch.Tensor | None = None,
@@ -1585,7 +1725,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
      ) -> torch.Tensor | IntermediateTensors:
          hidden_states = self.model(
              input_ids,
-@@ -1101,6 +1404,7 @@
+@@ -1101,6 +1426,7 @@
              intermediate_tensors,
              inputs_embeds,
              lookback_token_ids=lookback_token_ids,
@@ -1593,7 +1733,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          )
          return hidden_states
  
-@@ -1119,6 +1423,7 @@
+@@ -1119,6 +1445,7 @@
      def process_weights_after_loading(self) -> None:
          self.model.finalize_mega_moe_weights()
          self.model.finalize_mhc_broadcast_weights()
@@ -1603,8 +1743,20 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          return self.model.get_expert_mapping()
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/nvidia/vl_model.py vllm/models/deepseek_v4_1/nvidia/vl_model.py
 --- image-official/models/deepseek_v4_1/nvidia/vl_model.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/models/deepseek_v4_1/nvidia/vl_model.py	2026-09-11 08:44:20.892950860 -0700
-@@ -312,6 +312,7 @@
++++ vllm/models/deepseek_v4_1/nvidia/vl_model.py	2026-10-17 17:35:44.301995541 -0700
+@@ -100,6 +100,11 @@
+         orig_to_new_regex=base.orig_to_new_regex,
+         orig_to_new_suffix={
+             "head.weight": "language_model.lm_head.weight",
++            "head.trellis": "language_model.lm_head.trellis",  # dsv41 exl3
++            "head.suh": "language_model.lm_head.suh",
++            "head.svh": "language_model.lm_head.svh",
++            "head.mul1": "language_model.lm_head.mul1",
++            "head.mcg": "language_model.lm_head.mcg",
+             "embed.weight": "embed_tokens.weight",
+             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
+         },
+@@ -312,6 +317,7 @@
          intermediate_tensors=None,
          inputs_embeds: torch.Tensor | None = None,
          lookback_token_ids: torch.Tensor | None = None,
@@ -1612,7 +1764,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
          **kwargs,
      ) -> torch.Tensor:
          return self.language_model(
-@@ -320,6 +321,7 @@
+@@ -320,6 +326,7 @@
              intermediate_tensors,
              inputs_embeds,
              lookback_token_ids=lookback_token_ids,

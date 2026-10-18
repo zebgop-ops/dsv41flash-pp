@@ -100,6 +100,11 @@ def _make_deepseek_v4_vl_weights_mapper(
         orig_to_new_regex=base.orig_to_new_regex,
         orig_to_new_suffix={
             "head.weight": "language_model.lm_head.weight",
+            "head.trellis": "language_model.lm_head.trellis",  # dsv41 exl3
+            "head.suh": "language_model.lm_head.suh",
+            "head.svh": "language_model.lm_head.svh",
+            "head.mul1": "language_model.lm_head.mul1",
+            "head.mcg": "language_model.lm_head.mcg",
             "embed.weight": "embed_tokens.weight",
             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
         },

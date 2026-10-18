@@ -52,7 +52,19 @@ PATCHDIR=${DSV41_PATCH:-$RUNDIR/overlay/vllm}
 MEM_CAP=${DSV41_MEM_CAP_FRACTION:-0.965}   # clean OOM instead of an Xid-31 wedge near the top of a card
 
 # ---------------- preflight ----------------
-if [ -z "$SNAPSHOT" ] || [ ! -f "$REPO_DIR/snapshots/$SNAPSHOT/model-00048-of-00048.safetensors" ]; then
+EXL3=${DSV41_EXL3:-0}   # 1 = EXL3 pack (packed experts + dense linears, overlay/exl3 + exl3/site on PYTHONPATH, --quantization exl3)
+ENGRAM_MODEL_DIR=${DSV41_ENGRAM_MODEL_DIR:-}   # checkpoint dir (inside the container) holding Engram shards 47/48 when the model repo lacks them (EXL3 packs)
+if [ "$EXL3" = 1 ]; then
+  if [ -z "$SNAPSHOT" ] || [ ! -f "$REPO_DIR/snapshots/$SNAPSHOT/exl3_k_map.json" ]; then
+    echo "EXL3 pack not complete in $REPO_DIR (snapshot='$SNAPSHOT'; needs exl3_k_map.json)"; exit 1
+  fi
+  if [ -z "$ENGRAM_MODEL_DIR" ] || [ ! -f "$HFCACHE${ENGRAM_MODEL_DIR#/hf}/model-00048-of-00048.safetensors" ]; then
+    echo "DSV41_ENGRAM_MODEL_DIR must point (as a /hf/... container path) at a checkpoint with Engram shards 47/48"; exit 1
+  fi
+  for d in "$RUNDIR/exl3/site/exllamav3_ext.cpython-312-x86_64-linux-gnu.so" "$RUNDIR/overlay/exl3/dsv41_exl3.py"; do
+    [ -e "$d" ] || { echo "missing $d (run exl3/build-exllamav3.sh)"; exit 1; }
+  done
+elif [ -z "$SNAPSHOT" ] || [ ! -f "$REPO_DIR/snapshots/$SNAPSHOT/model-00048-of-00048.safetensors" ]; then
   echo "checkpoint not complete in $REPO_DIR (snapshot='$SNAPSHOT'; the REAP repos need the base model's Engram shards 47/48 linked in)"; exit 1
 fi
 if ls "$REPO_DIR/blobs/"*.incomplete >/dev/null 2>&1; then
@@ -63,7 +75,7 @@ ULIB=$(dpkg-query -W -f='${Version}' libnvidia-compute-610 2>/dev/null | cut -d-
 if [ -n "$KMOD" ] && [ -n "$ULIB" ] && [ "$KMOD" != "$ULIB" ]; then
   echo "NVIDIA driver mismatch: kernel module $KMOD vs userland $ULIB -> new CUDA containers cannot start; reboot first"; exit 1
 fi
-for other in dsv4-a100 qwen38-pp qwen38u-pp glm53flash-pp glm53nvfp4-pp glm53u-mm dsv41-pp dsv41reap-pp dsv41-1017-pp; do
+for other in dsv4-a100 qwen38-pp qwen38u-pp glm53flash-pp glm53nvfp4-pp glm53u-mm dsv41-pp dsv41reap-pp dsv41-1017-pp dsv41-exl3-pp; do
   if [ "$other" != "$NAME" ] && docker ps --format '{{.Names}}' | grep -qx "$other"; then
     echo "refusing to start: $other is running on the same GPUs (stop it yourself first)"; exit 1
   fi
@@ -84,6 +96,16 @@ if [ -d "$PATCHDIR" ]; then
   done < <(find "$PATCHDIR" -type f -name '*.py')
 fi
 MOUNTS+=(-v "$RUNDIR/overlay/engram_ssd:/opt/dsv41/engram_ssd:ro" -v "$RUNDIR/overlay/hybrid:/opt/dsv41/hybrid:ro" -v "$RUNDIR/kt/site:/opt/dsv41/kt-site:ro")
+PYPATH=/opt/dsv41:/opt/dsv41/kt-site
+QUANT_ARGS=()
+EXL3_ENV=()
+if [ "$EXL3" = 1 ]; then
+  mkdir -p "$RUNDIR/exl3/tune-cache"
+  MOUNTS+=(-v "$RUNDIR/exl3/site:/opt/dsv41/exl3-site:ro" -v "$RUNDIR/overlay/exl3:/opt/dsv41/exl3:ro" -v "$RUNDIR/exl3/tune-cache:/opt/dsv41/exl3-tune")
+  PYPATH="$PYPATH:/opt/dsv41/exl3-site:/opt/dsv41/exl3"
+  QUANT_ARGS+=(--quantization exl3)
+  EXL3_ENV=(-e VLLM_DISABLE_SHARED_EXPERTS_STREAM=1 -e EXLLAMAV3_TUNE_CACHE=/opt/dsv41/exl3-tune -e EXL3_PRETUNE_ROWS="${EXL3_PRETUNE_ROWS:-1,2,3,4,6,8,12,16}")   # one stream only (shared lock buffer); persistent gemm autotune cache; pre-tune rows before capture
+fi
 
 # Tensors the GPU loader must not even mmap: Engram tables in SSD mode, and the experts of
 # the CPU layers (kt-kernel reads those itself).
@@ -126,15 +148,15 @@ docker run -d --name "$NAME" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$GPU_OR
   --ipc=host --shm-size 32g -p "$PORT:$PORT" \
   -v "$HFCACHE:/hf" "${MOUNTS[@]}" \
   -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 \
-  -e PYTHONPATH=/opt/dsv41:/opt/dsv41/kt-site \
+  -e PYTHONPATH="$PYPATH" -e DSV41_EXL3="$EXL3" -e DSV41_EXL3_K_MAP="$MODEL/exl3_k_map.json" -e EXL3_FUSED_MOE="${EXL3_FUSED_MOE:-1}" -e EXL3_TEMP_ROWS_FUSED="${EXL3_TEMP_ROWS_FUSED:-128}" -e EXL3_MOE_NUM_ACTIVE="${EXL3_MOE_NUM_ACTIVE:--1}" \
   -e VLLM_PP_LAYER_PARTITION="$PARTITION" \
   -e DSV41_CPU_EXPERT_LAYERS="$CPU_LAYERS" -e DSV41_ENGRAM_STORAGE="$ENGRAM" \
-  -e DSV41_ENGRAM_ZERO="${DSV41_ENGRAM_ZERO:-0}" -e DSV41_DEBUG_STATS="${DSV41_DEBUG_STATS:-0}" -e DSV41_MHC_TORCH="${DSV41_MHC_TORCH:-0}" -e DSV41_DEBUG_DUMP="${DSV41_DEBUG_DUMP:-}" -e DSV41_CPU_MOE="${DSV41_CPU_MOE:-native}" -e DSV41_DEBUG_TIMING="${DSV41_DEBUG_TIMING:-0}" -e DSV41_DEBUG_PROFILE="${DSV41_DEBUG_PROFILE:-0}" -e DSV41_DEBUG_GDUMP="${DSV41_DEBUG_GDUMP:-}" -e DSV41_DEBUG_SPEC="${DSV41_DEBUG_SPEC:-0}" -e DSV41_DEBUG_ENGRAM="${DSV41_DEBUG_ENGRAM:-0}" -e DSV41_PREFILL_EAGER="${DSV41_PREFILL_EAGER:-1}" -e DSV41_FULL_Q1="${DSV41_FULL_Q1:-1}" -e DSV41_DEBUG_CORE="${DSV41_DEBUG_CORE:-0}" -e DSV41_DEBUG_TRACE="${DSV41_DEBUG_TRACE:-0}" -e DSV41_DEBUG_TRACE_PREFILL="${DSV41_DEBUG_TRACE_PREFILL:-0}" -e DSV41_DEBUG_DSPARK="${DSV41_DEBUG_DSPARK:-0}" -e DSV41_DSPARK_CONF="${DSV41_DSPARK_CONF:-0.7}" -e DSV41_DEBUG_SYNC="${DSV41_DEBUG_SYNC:-0}" -e DSV41_DRAFT_SKIP_PREFILL="${DSV41_DRAFT_SKIP_PREFILL:-1}" -e DSV41_CPU_EXPERT_THREADS="${DSV41_CPU_EXPERT_THREADS:-16}" -v /home/r/dsv41-run/dump:/dump -e DSV41_MODEL_DIR="$MODEL" -e DSV41_MEM_CAP_FRACTION="$MEM_CAP" -e DSV41_SKIP_WEIGHT_RE="$SKIP_RE" \
+  -e DSV41_ENGRAM_ZERO="${DSV41_ENGRAM_ZERO:-0}" -e DSV41_DEBUG_STATS="${DSV41_DEBUG_STATS:-0}" -e DSV41_MHC_TORCH="${DSV41_MHC_TORCH:-0}" -e DSV41_DEBUG_DUMP="${DSV41_DEBUG_DUMP:-}" -e DSV41_CPU_MOE="${DSV41_CPU_MOE:-native}" -e DSV41_DEBUG_TIMING="${DSV41_DEBUG_TIMING:-0}" -e DSV41_DEBUG_PROFILE="${DSV41_DEBUG_PROFILE:-0}" -e DSV41_DEBUG_GDUMP="${DSV41_DEBUG_GDUMP:-}" -e DSV41_DEBUG_SPEC="${DSV41_DEBUG_SPEC:-0}" -e DSV41_DEBUG_ENGRAM="${DSV41_DEBUG_ENGRAM:-0}" -e DSV41_PREFILL_EAGER="${DSV41_PREFILL_EAGER:-1}" -e DSV41_FULL_Q1="${DSV41_FULL_Q1:-1}" -e DSV41_DEBUG_CORE="${DSV41_DEBUG_CORE:-0}" -e DSV41_DEBUG_TRACE="${DSV41_DEBUG_TRACE:-0}" -e DSV41_DEBUG_TRACE_PREFILL="${DSV41_DEBUG_TRACE_PREFILL:-0}" -e DSV41_DEBUG_DSPARK="${DSV41_DEBUG_DSPARK:-0}" -e DSV41_DSPARK_CONF="${DSV41_DSPARK_CONF:-0.7}" -e DSV41_DEBUG_SYNC="${DSV41_DEBUG_SYNC:-0}" -e DSV41_DRAFT_SKIP_PREFILL="${DSV41_DRAFT_SKIP_PREFILL:-1}" -e DSV41_CPU_EXPERT_THREADS="${DSV41_CPU_EXPERT_THREADS:-16}" -v /home/r/dsv41-run/dump:/dump -e DSV41_MODEL_DIR="${ENGRAM_MODEL_DIR:-$MODEL}" -e DSV41_MEM_CAP_FRACTION="$MEM_CAP" -e DSV41_SKIP_WEIGHT_RE="$SKIP_RE" \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e VLLM_USE_V2_MODEL_RUNNER=0 -e PYTHONFAULTHANDLER=1 \
-  ${DSV41_EXTRA_DOCKER:-} \
+  "${EXL3_ENV[@]}" ${DSV41_EXTRA_DOCKER:-} \
   "$IMG" \
   "$MODEL" --served-model-name "$SERVED" --port "$PORT" \
-  --pipeline-parallel-size "$PP" --gpu-memory-utilization "$UTIL" \
+  --pipeline-parallel-size "$PP" --gpu-memory-utilization "$UTIL" "${QUANT_ARGS[@]}" \
   --max-model-len "$MAXLEN" --max-num-seqs "$SEQS" --max-num-batched-tokens "$BATCHED" \
   --attention-backend TRITON_MLA_SPARSE_DSV41 --kv-cache-dtype fp8 --attention-config '{"indexer_kv_dtype":"fp8"}' \
   -cc.cudagraph_mode="$CG" --no-enable-prefix-caching \
