@@ -56,6 +56,8 @@ FILES=(
   v1/core/kv_cache_utils.py
   v1/attention/backends/mla/indexer.py
   utils/deep_gemm.py
+  tokenizers/deepseek_v41_encoding.py
+  tokenizers/deepseek_v41.py
 )
 CID=$(docker create "$IMG")
 trap 'docker rm "$CID" >/dev/null' EXIT

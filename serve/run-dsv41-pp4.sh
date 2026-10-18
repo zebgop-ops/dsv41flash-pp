@@ -63,7 +63,7 @@ ULIB=$(dpkg-query -W -f='${Version}' libnvidia-compute-610 2>/dev/null | cut -d-
 if [ -n "$KMOD" ] && [ -n "$ULIB" ] && [ "$KMOD" != "$ULIB" ]; then
   echo "NVIDIA driver mismatch: kernel module $KMOD vs userland $ULIB -> new CUDA containers cannot start; reboot first"; exit 1
 fi
-for other in dsv4-a100 qwen38-pp qwen38u-pp glm53flash-pp glm53nvfp4-pp dsv41-pp dsv41reap-pp; do
+for other in dsv4-a100 qwen38-pp qwen38u-pp glm53flash-pp glm53nvfp4-pp glm53u-mm dsv41-pp dsv41reap-pp dsv41-1017-pp; do
   if [ "$other" != "$NAME" ] && docker ps --format '{{.Names}}' | grep -qx "$other"; then
     echo "refusing to start: $other is running on the same GPUs (stop it yourself first)"; exit 1
   fi

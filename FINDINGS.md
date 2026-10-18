@@ -269,6 +269,48 @@ cache is bind-mounted at `/hf` inside the container; `link-reap-engram.sh`). Exp
   2.4k tok/s at 6k and 3.1k tok/s at 14k tokens, outputs unchanged. What remains is the per-rank
   chunk compute (~650 ms per 2048 tokens on the slowest rank) and the queue depth.
 
+## 10. The 1017 checkpoint: what moved upstream in five weeks, and what was worth back-porting
+
+`deepseek-ai/DeepSeek-V4.1-Flash-1017` (2026-10-17) is a weights-only update: `config.json`,
+tokenizer and the 48-shard layout are byte-identical to the 0909 release, so the overlay loads it
+unchanged. We serve `mrfakename/DeepSeek-V4.1-Flash-1017-abliterated` (the user's pick): a rank-2
+refusal subspace projected out of `attn.wo_b` and `ffn.shared_experts.w2` in the 40 main layers
+(requantized to FP8 with the original block scales); routed experts, embeddings, Engram tables and
+the DSpark layers are the official 1017 bytes, and the repo ships its own Engram shards 47/48.
+`serve/run-dsv41-1017-pp4.sh` wraps the launcher (container `dsv41-1017-pp`, :8007, `DSv41Flash1017`).
+
+**Why not a newer vLLM.** Upstream merged the model (#56214, #56228) and has since moved it to
+`vllm/models/deepseek_v41/`, renamed half the files our 27 anchor-based patches touch, and is 1,185
+commits past v0.31.0; the official `deepseekv41-flash-0909` image is still the only DeepSeek-V4.1
+image. Morrowmake's `vllm-cmp170hx` fork (0.32-dev, sm_80) serves GLM-5.3-Flash and
+Qwen3.8-Flash-Next and has no DeepSeek-V4.1 code; its general pieces (packed PP hop, host
+all-reduce, thin GEMMs) address costs that are not this model's floor here. The floor is the CPU
+experts' DRAM bandwidth (§5), which no runner change moves. So the stack stays, and the upstream
+delta was audited PR by PR for things that change outputs or memory on this layout:
+
+| upstream | what it is | here |
+|---|---|---|
+| #56227 (merged 09-18) SWA-bounded replay | SWA caches leave prefix caching, the last 128 tokens of a prefix hit are recomputed; needs runner V2 | not a prefill win, V1 runner (Engram) → skipped |
+| #62196 / #62199 (open) 1017 reference encoding | a user turn holding only tool results no longer ends the assistant turn (reasoning before a tool call is kept); content-block tool results stay structured; a literal image token in text is a 400 | `patch_encoding_1017.py` |
+| 0909 image vs the reference encoder | the image's reasoning-effort table was low/high/xhigh/max = 25/50/75/100; DeepSeek's reference (0909 and 1017 alike) is low/high/max = 50/75/100 with `high` the default, so every default thinking request on this stack carried budget 50 instead of 75. Upstream main is now 50/75/75/100; #62226 adds `minimal`/`medium` | same patch: reference values, aliases |
+| reference `latest_reminder` role | rendered by the image's encoder but rejected by its wrapper's role whitelist (#61446 fixes the Rust side) | same patch |
+| #62208 (open) Engram at a stage entry | the first layer of a non-initial PP stage skipped its Engram injection; a partition starting a stage at layer 1 or 14 silently lost Engram | `patch_engram_stage_entry.py` (our partitions never cut there) |
+| #61451, #58668, #46399 (merged) | spec-decode sampler micro-perf, stop-trimmed token accounting, dynamic-K guard | not on our paths |
+| #61371 FlashMLA 2026.09.30 | Hopper kernels | n/a on sm_80 |
+
+The encoder changes are checked against DeepSeek's own golden fixtures (`encoding/tests/` in the
+1017 repo, five conversations covering tools, thinking, `latest_reminder`, quick-instruction tasks
+and images): `ktests/test_encoding_1017.py` replays them through vLLM's tokenizer wrapper inside the
+image. The unpatched image matches 2 of 5 (cases 1, 3, 4 fail: budget 50 vs 75, and the reminder
+role); with the overlay all 5 match byte for byte.
+
+**Memory at utilization 0.93.** Cards driven to 61-63 GiB have crashed on this box (§4), so the
+1017 server runs at 0.93 like the REAP one. The base layout (8,12,8,12 with 9 CPU layers) left
+rank 0 only 0.91 GiB of KV at 0.97, i.e. ~61 GiB in use; at 0.93 it cannot allocate a cache. The
+wrapper therefore puts layer 7 (the last of rank 0) on the CPU as well and halves the prefill chunk
+(1024 tokens; the eager-prefill activation peak is what the profiler reserves). The measured
+per-rank numbers and the resulting speed are in RESULTS.md.
+
 ## Diagnostic switches (all off by default)
 
 | switch | effect |

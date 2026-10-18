@@ -123,6 +123,36 @@ model produces the same texts with flatter distributions (up to 2.5-4.3 nats on 
 The 10,10,10,10 layout was checked against 8,12,8,12 (identical code-edit output, prose diverging
 at char 429, i.e. the stack's usual kernel numerics) and with the 30k needle test.
 
+### DeepSeek-V4.1-Flash-1017, abliterated (`serve/run-dsv41-1017-pp4.sh`, :8007)
+
+`mrfakename/DeepSeek-V4.1-Flash-1017-abliterated`: DeepSeek's 2026-10-17 weights refresh (same config,
+tokenizer and shard layout as 0909; all 48 shards differ) with a rank-2 refusal subspace projected out
+of `attn.wo_b` and `ffn.shared_experts.w2`; shards 1-2 and 43-48 (embeddings, DSpark layers, Engram
+tables) are the official 1017 bytes (Hub SHA-256 per shard). Served at utilization 0.93 (FINDINGS §4,
+§10): 12 cold layers' experts on the CPU (7, 15-19, 27, 35-39) so that each rank keeps 7 GPU expert
+layers, prefill chunk 1088 tokens, context 262,144. Same prompts as above, streaming with thinking
+off unless noted, n-gram K=3.
+
+| workload | 0909 base, 9 CPU layers, util 0.97 | 1017, 12 CPU layers, util 0.93 |
+|---|---|---|
+| free prose, 400 tokens streaming | 26-28 s (14 tok/s) | 30.6 s (13.1 tok/s) |
+| code edit, 529-token prompt, 400 tokens streaming | 23.5 s | 27.2 s (123 steps, 97% drafts accepted) |
+| specbench prose / code-edit (thinking on, incl. prefill) | 13.6 / 14.8 tok/s | 12.7 / 13.2 tok/s |
+| KV pool | 904k tokens at 131k max-model-len | 4.26M tokens at 262k (16x a 256k request) |
+| GPU used per rank while serving | 58.8 / 58.6 / 57.6 / 53.5 GiB weights, up to ~61 GiB | 56.3 / 57.7 / 57.1 / 60.1 GiB |
+| after profiling, before KV | – | 54.3 / 53.8 / 53.2 / 56.8 GiB |
+| host RAM | 81 GB serving, 87 GB peak | 99 GB serving, 107 GB peak |
+
+The ~15% decode cost is the three extra CPU layers (~2.4 ms each per 1-row step, more per verify
+row); the 10-layer attempt (7,16-19,35-39) measured 53.9 / 60.3 / 59.4 / 56.2 GiB after profiling and
+vLLM found no KV room on ranks 1-2 at 0.93.
+
+Quality so far (same harness and inputs as the 0909 base, `tools/quality.py`): wikitext-2 perplexity
+2.753 vs 2.715 for the 0909 base (+1.4%, 67,131 tokens, 36 windows; the weights refresh and the
+abliteration edit are not separable here). Code perplexity, MMLU-1000 and HumanEval+/MBPP+ were
+interrupted when the GPUs were needed elsewhere and are pending (`tools/eval-1017.sh`,
+`tools/eval-1017-code.sh` resume them against a running server).
+
 ## Memory
 
 | rank | layers | GPU weights + non-torch | KV pool |
