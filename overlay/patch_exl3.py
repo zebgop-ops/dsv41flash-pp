@@ -94,7 +94,7 @@ patch("models/deepseek_v4_1/amd/rocm.py", [
     ('    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:\n        # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.\n        z = rocm_inv_rope_einsum(\n',
      '    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:\n'
      '        # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.\n'
-     '        if getattr(self.wo_a, "weight", None) is None:  # dsv41 exl3: packed wo_a, one matrix per o-group\n'
+     '        if getattr(self.wo_a, "weight", None) is None and getattr(self.wo_a, "_dsv4_wo_a_bf16", None) is None:  # dsv41 exl3: packed wo_a, one matrix per o-group\n'
      '            from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _fused_inverse_rope_gptj\n'
      '            o_ref = _fused_inverse_rope_gptj(o, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)\n'
      '            o_ref = o_ref.view(o.shape[0], self.n_local_groups, -1)\n'

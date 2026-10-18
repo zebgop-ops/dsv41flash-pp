@@ -1228,8 +1228,11 @@ class Worker(WorkerBase):
                 raise
             _dsv41_t1 = time.perf_counter()
         _dsv41_prof = None
-        if os.environ.get("DSV41_DEBUG_PROFILE") == "1" and scheduler_output.total_num_scheduled_tokens == 1:
-            self._dsv41_pcount = getattr(self, "_dsv41_pcount", 0) + 1
+        _dsv41_pT = scheduler_output.total_num_scheduled_tokens
+        if os.environ.get("DSV41_DEBUG_PROFILE") == "1" and str(_dsv41_pT) in os.environ.get("DSV41_DEBUG_PROFILE_T", "1").split(","):
+            _pc = self.__dict__.setdefault("_dsv41_pcounts", {})
+            _pc[_dsv41_pT] = _pc.get(_dsv41_pT, 0) + 1
+            self._dsv41_pcount = _pc[_dsv41_pT]
             if self._dsv41_pcount in (40, 41):
                 from torch.profiler import ProfilerActivity, profile as _tprofile
                 _dsv41_prof = _tprofile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
@@ -1268,7 +1271,7 @@ class Worker(WorkerBase):
                 rows = sorted(ka, key=lambda e: -getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)))
                 tot = sum(getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)) for e in ka
                           if not getattr(e, "is_async", False))
-                lines = [f"DSV41 PROFILE rank {get_pp_group().rank_in_group} T=1 step: kernels by device time (us); "
+                lines = [f"DSV41 PROFILE rank {get_pp_group().rank_in_group} T={_dsv41_pT} step: kernels by device time (us); "
                          f"self-cpu total {sum(e.self_cpu_time_total for e in ka):.0f} us; device total {tot:.0f} us"]
                 for e in rows[:40]:
                     dt = getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0))

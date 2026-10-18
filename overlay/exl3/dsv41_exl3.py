@@ -71,6 +71,52 @@ def pretune_rows() -> list[int]:
     return [int(x) for x in raw.split(",") if x.strip()]
 
 
+def dense_w8_enabled(prefix: str) -> bool:
+    """EXL3_DENSE_W8=1: dense EXL3 linears (not the lm_head) are reconstructed at load and re-stored as 8-bit
+    integers with one bf16 scale per 128 inputs per output column, run by vLLM's Marlin W8A16 kernel. The
+    5-bit EXL3 reconstruction is re-rounded with ~0.4% relative error (EXL3's own is ~3%)."""
+    if os.environ.get("EXL3_DENSE_W8", "0") == "0":
+        return False
+    return not (prefix == "lm_head" or prefix.endswith("lm_head"))
+
+
+_W8_WS: dict[str, torch.Tensor] = {}
+_W8_CHECKED = [False]
+
+
+def to_marlin_w8(w_kn: torch.Tensor, group: int = 128):
+    """[K, N] weight -> (Marlin-repacked uint8b128 qweight, permuted bf16 scales [K/group, N], dequant rel err)."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import marlin_permute_scales
+    K, N = w_kn.shape
+    assert K % group == 0 and N % 64 == 0, (K, N)
+    wf = w_kn.float().view(K // group, group, N)
+    scale = (wf.abs().amax(dim=1) / 127.0).clamp(min=1e-12)                      # [K/g, N]
+    q = torch.round(wf / scale[:, None, :]).clamp(-127, 127)
+    err = ((q * scale[:, None, :] - wf).norm() / wf.norm()).item()
+    q = (q.to(torch.int64) + 128).view(K // 4, 4, N)                            # uint8b128, GPTQ packing along K
+    packed = q[:, 0] | (q[:, 1] << 8) | (q[:, 2] << 16) | (q[:, 3] << 24)
+    packed = torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32).contiguous()
+    perm = torch.empty(0, dtype=torch.int32, device=w_kn.device)
+    mq = ops.gptq_marlin_repack(packed, perm, K, N, 8)
+    ms = marlin_permute_scales(scale.to(torch.bfloat16), K, N, group)
+    return mq, ms, err
+
+
+def apply_marlin_w8(layer, x: torch.Tensor, bias=None) -> torch.Tensor:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        apply_gptq_marlin_linear, marlin_make_workspace_new)
+    from vllm.scalar_type import scalar_types
+    dev = x.device
+    ws = _W8_WS.get(str(dev))
+    if ws is None:
+        ws = _W8_WS[str(dev)] = marlin_make_workspace_new(dev, 4)
+    e = layer._w8_empty
+    return apply_gptq_marlin_linear(
+        x.to(torch.bfloat16), layer._w8_q, layer._w8_s, e, e, e, ws, scalar_types.uint8b128,
+        layer._w8_n, layer._w8_k, True, bias=bias, use_fp32_reduce=True).to(x.dtype)
+
+
 def pretune_linear(inner, rows: list[int]) -> None:
     if not rows or torch.cuda.is_current_stream_capturing():
         return
@@ -309,11 +355,13 @@ def moe_num_active() -> int:
     return int(os.environ.get("EXL3_MOE_NUM_ACTIVE", "-1"))
 
 
-def _exl3_moe_launch(xh, out, expert_count, token_sorted, weight_sorted, temps, ptrs, layer, limit, num_active=None):
-    """One exl3_moe launch (exllamav3 1.6.x ABI: float K, num_active, det scratch off, 16-row tile)."""
+def _exl3_moe_launch(xh, out, expert_count, token_sorted, weight_sorted, temps, ptrs, layer, limit, num_active=None,
+                     count_lo=1, count_hi=None, m_tile=16):
+    """One exl3_moe launch (exllamav3 1.6.x ABI: float K, num_active, det scratch off). Experts whose row
+    count lies outside [count_lo, count_hi] are skipped; m_tile = rows per GEMM tile (16, or 32/64 for mul1)."""
     if num_active is None:
         num_active = moe_num_active()
-    cap = int(temps[0].shape[1])
+    cap = int(temps[0].shape[1]) if count_hi is None else int(count_hi)
     ext().exl3_moe(
         xh, out, expert_count, token_sorted, weight_sorted,
         temps[0], temps[1], temps[2], temps[3],
@@ -325,7 +373,7 @@ def _exl3_moe_launch(xh, out, expert_count, token_sorted, weight_sorted, temps, 
         bool(layer._exl3_mcg), bool(layer._exl3_mul1),
         bool(layer._exl3_mcg), bool(layer._exl3_mul1),
         bool(layer._exl3_mcg), bool(layer._exl3_mul1),
-        float(limit), int(num_active), None, None, 1, cap, 16,
+        float(limit), int(num_active), None, None, int(count_lo), cap, int(m_tile),
     )
 
 
@@ -375,7 +423,63 @@ def apply_exl3_python_loop(x2d, ids, weights, inners, limit, *, only_experts=Non
     return out
 
 
+COOP_MAX_TOKENS = 8                        # exl3_moe_coop handles bsz 1..MAX_BSZN (8)
+_COOP_SCRATCH: dict[tuple, dict[str, torch.Tensor]] = {}
+
+
+def coop_enabled() -> bool:
+    return os.environ.get("EXL3_MOE_COOP", "1") != "0"
+
+
+def _coop_scratch(device, topk: int, H: int, I: int) -> dict[str, torch.Tensor]:
+    """Static scratch for exl3_moe_coop, shared by every layer on a device (layers run one at a time on the
+    single stream): per-slot rotated inputs, gate/up outputs, activations, down partials, and the int32
+    completion counters + run table (zero-initialized; the kernels reset them after use)."""
+    key = (str(device), topk, H, I)
+    sc = _COOP_SCRATCH.get(key)
+    if sc is None:
+        slots = COOP_MAX_TOKENS * topk
+        ctr_len = slots * (I // 128) + COOP_MAX_TOKENS * (H // 128) + 2 + (slots + 1) + slots
+        sc = {
+            "had_g": torch.empty((slots, H), dtype=torch.float16, device=device),
+            "had_u": torch.empty((slots, H), dtype=torch.float16, device=device),
+            "gu_g": torch.empty((slots, I), dtype=torch.float16, device=device),
+            "gu_u": torch.empty((slots, I), dtype=torch.float16, device=device),
+            "act": torch.empty((slots, I), dtype=torch.float16, device=device),
+            "d_out": torch.empty((slots, H), dtype=torch.float32, device=device),
+            "ctr": torch.zeros(ctr_len, dtype=torch.int32, device=device),
+        }
+        _COOP_SCRATCH[key] = sc
+    return sc
+
+
+def apply_exl3_coop_moe(x2d, ids, weights, layer, limit):
+    """Decode-shaped MoE through exllamav3's cooperative kernel: two ordinary launches per layer (gate/up
+    with activation, then down), no inter-block group barriers, the rotation folded in. Graph-safe: shapes
+    are static and the counters self-reset."""
+    tokens, hidden = x2d.shape
+    ptrs = layer._exl3_ptrs
+    H, I = int(layer._exl3_hidden_size), int(layer._exl3_intermediate_local)
+    sc = _coop_scratch(x2d.device, int(ids.shape[-1]), H, I)
+    out = torch.zeros(tokens, hidden, dtype=torch.float32, device=x2d.device)
+    ext().exl3_moe_coop(
+        x2d.contiguous().half(), ids.contiguous(), weights.to(torch.float16).contiguous(), -1, 0, H,
+        ptrs["gate_trellis"], ptrs["gate_suh"], ptrs["gate_svh"],
+        ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
+        ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
+        None, None, None,
+        float(layer._exl3_k_gate), float(layer._exl3_k_up), float(layer._exl3_k_down),
+        bool(layer._exl3_mcg), bool(layer._exl3_mul1),
+        MOE_ACT_SILU, float(limit), True,
+        sc["had_g"], sc["had_u"], sc["gu_g"], sc["gu_u"], sc["act"], sc["d_out"], sc["ctr"], out,
+        None, None,
+    )
+    return out
+
+
 def apply_exl3_fused_moe(x2d, ids, weights, layer, inners, limit):
+    if x2d.shape[0] <= COOP_MAX_TOKENS and coop_enabled():
+        return apply_exl3_coop_moe(x2d, ids, weights, layer, limit)
     tokens, hidden = x2d.shape
     n_exp = len(inners)
     ptrs, temps = layer._exl3_ptrs, layer._exl3_fused_temps
@@ -383,7 +487,7 @@ def apply_exl3_fused_moe(x2d, ids, weights, layer, inners, limit):
     invalid = (flat < 0) | (flat >= n_exp)
     local = torch.where(invalid, flat.new_full(flat.shape, n_exp), flat)
     topk = int(ids.shape[-1])
-    flat_token = torch.arange(tokens, device=x2d.device, dtype=torch.long).repeat_interleave(topk)
+    flat_token = torch.arange(tokens * topk, device=x2d.device, dtype=torch.long) // topk
     flat_weight = weights.reshape(-1).to(torch.float16)
     order = local.argsort()
     token_sorted, weight_sorted = flat_token[order], flat_weight[order]
@@ -393,14 +497,57 @@ def apply_exl3_fused_moe(x2d, ids, weights, layer, inners, limit):
     xh = x2d.contiguous().half()
     cap = int(temps[0].shape[1])
     if tokens <= cap:   # decode / small batches: one graph-safe launch, no host sync
-        _exl3_moe_launch(xh, out, expert_count, token_sorted, weight_sorted, temps, ptrs, layer, limit)
+        # One token routes to exactly top-k distinct experts: say so, and the kernel launches top-k groups
+        # of 70/top-k SMs (66 of 70 busy) instead of 8 groups of 8 with two idle (48 of 70). The row count is
+        # static under CUDA graphs, so this is decided at capture time. EXL3_MOE_NUM_ACTIVE overrides.
+        na = moe_num_active()
+        if na == -1 and tokens == 1 and os.environ.get("EXL3_MOE_T1_EXACT", "1") != "0":
+            na = topk
+        _exl3_moe_launch(xh, out, expert_count, token_sorted, weight_sorted, temps, ptrs, layer, limit, na)
         return out
     counts = expert_count[:n_exp]
+    if os.environ.get("EXL3_PREFILL_TIERS", "1") != "0" and getattr(layer, "_exl3_mul1", False):
+        out = _exl3_prefill_tiered(x2d, xh, out, ids, weights, counts, expert_count, token_sorted, weight_sorted,
+                                   temps, ptrs, layer, inners, limit)
+        return out
     max_rows = int(counts.max().item())
     if max_rows <= cap:
         _exl3_moe_launch(xh, out, expert_count, token_sorted, weight_sorted, temps, ptrs, layer, limit)
     else:
         _exl3_moe_row_tiles(xh, out, counts, token_sorted, weight_sorted, temps, ptrs, layer, limit, max_rows)
+    return out
+
+
+_TIER_CHECKED = [False]
+
+
+def _exl3_prefill_tiered(x2d, xh, out, ids, weights, counts, expert_count, token_sorted, weight_sorted,
+                         temps, ptrs, layer, inners, limit):
+    """Prefill-shaped MoE (eager, so one host sync is fine): every expert's trellis is decoded once per
+    m-row tile, so tile height follows the expert's row count as in exllamav3's own engine: <=16 rows in
+    16-row tiles, 17-32 in 32-row tiles, up to the temp capacity in 64-row tiles; experts above it are
+    reconstructed once and run as fp16 tensor-core GEMMs (LinearEXL3's reconstruct path)."""
+    cap = int(temps[0].shape[1])
+    ch = counts.tolist()
+    tiers = ((1, 16, 16), (17, 32, 32), (33, cap, 64))
+    for lo, hi, mt in tiers:
+        n = sum(1 for c in ch if lo <= c <= hi)
+        if n:
+            _exl3_moe_launch(xh, out, expert_count, token_sorted, weight_sorted, temps, ptrs, layer, limit,
+                             num_active=n, count_lo=lo, count_hi=hi, m_tile=mt)
+    fat = {e for e, c in enumerate(ch) if c > cap}
+    if fat:
+        apply_exl3_python_loop(x2d, ids, weights, inners, limit, only_experts=fat, out=out)
+    if not _TIER_CHECKED[0] and os.environ.get("EXL3_TIER_CHECK", "1") != "0":
+        _TIER_CHECKED[0] = True   # one-time check against the plain 16-row fused path with row tiles
+        ref = torch.zeros_like(out)
+        max_rows = max(ch)
+        if max_rows <= cap:
+            _exl3_moe_launch(xh, ref, expert_count, token_sorted, weight_sorted, temps, ptrs, layer, limit)
+        else:
+            _exl3_moe_row_tiles(xh, ref, counts, token_sorted, weight_sorted, temps, ptrs, layer, limit, max_rows)
+        logger.info("EXL3 tiered prefill check (%d tokens, %d fat experts, max rows %d): rel err vs 16-row path %.2e",
+                    x2d.shape[0], len(fat), max_rows, ((out - ref).norm() / ref.norm()).item())
     return out
 
 
@@ -619,15 +766,64 @@ class Exl3LinearMethod(LinearMethodBase):
             layer._exl3_inners = inners
             layer._exl3_inner = None
             layer._exl3_k = int(stash[0]["trellis"].shape[-1]) // 16
+            if getattr(layer, "is_bmm", False) and len(inners) > 1 and os.environ.get("EXL3_WO_A_DENSE", "1") != "0":
+                # Grouped wo_a: 8 small per-group GEMV launches per layer are latency-bound (~20 us each).
+                # Rebuild the exact weights once into the [G, out, in] bf16 operand the inverse-RoPE einsum
+                # path caches (_get_cached_wo_a_bf16), so o_proj is one batched matmul; drop the packed copy.
+                dense = torch.stack([h.get_weight_tensor().t().contiguous() for h in inners]).to(torch.bfloat16)
+                if not getattr(Exl3LinearMethod, "_woa_checked", False):
+                    x = torch.randn(4, len(inners), int(inners[0].in_features), device=dense.device, dtype=torch.float16)
+                    ref = torch.stack([h.forward(x[:, g].contiguous(), {}, out_dtype=torch.float32)
+                                       for g, h in enumerate(inners)], dim=1)
+                    got = torch.einsum("tgd,grd->tgr", x.to(torch.bfloat16), dense).float()
+                    logger.info("EXL3 wo_a dense rebuild %s: %s, rel err vs packed kernel %.2e", self.prefix,
+                                tuple(dense.shape), ((got - ref).norm() / ref.norm()).item())
+                    Exl3LinearMethod._woa_checked = True
+                layer._dsv4_wo_a_bf16 = dense
+                layer._exl3_inners = None
+                layer._exl3_fused_stash = {}
+                return
+            if dense_w8_enabled(self.prefix):
+                self._to_w8(layer, inners)
+                return
             for h in inners:
                 pretune_linear(h, pretune_rows())
             return
         layer._exl3_inner = make_linear_exl3(layer.trellis, layer.suh, layer.svh, layer.mul1, codebook=self.codebook)
         layer._exl3_inners = None
         layer._exl3_k = int(layer.trellis.shape[-1]) // 16
+        if dense_w8_enabled(self.prefix):
+            self._to_w8(layer, [layer._exl3_inner])
+            return
         pretune_linear(layer._exl3_inner, pretune_rows())
 
+    def _to_w8(self, layer, inners) -> None:
+        """Reconstruct the EXL3 matrices (merged ones concatenated along N, so they become one launch),
+        re-store them as Marlin W8A16, and free the packed EXL3 tensors."""
+        w = torch.cat([h.get_weight_tensor() for h in inners], dim=1)              # [K, N]
+        K, N = w.shape
+        mq, ms, err = to_marlin_w8(w)
+        layer._w8_q, layer._w8_s, layer._w8_k, layer._w8_n = mq, ms, K, N
+        layer._w8_empty = torch.empty(0, dtype=torch.int32, device=w.device)
+        if not _W8_CHECKED[0]:
+            _W8_CHECKED[0] = True
+            x = torch.randn(4, K, device=w.device, dtype=torch.bfloat16)
+            ref = torch.cat([h.forward(x.half().contiguous(), {}, out_dtype=torch.float32) for h in inners], dim=-1)
+            got = apply_marlin_w8(layer, x).float()
+            logger.info("EXL3 dense -> Marlin W8A16 %s [K=%d, N=%d]: weight re-rounding rel err %.2e, "
+                        "output rel err vs EXL3 kernel %.2e", self.prefix, K, N, err, ((got - ref).norm() / ref.norm()).item())
+        for name in ("trellis", "suh", "svh"):
+            prm = getattr(layer, name, None)
+            if isinstance(prm, torch.nn.Parameter) and prm.numel():
+                prm.data = torch.empty(0, dtype=prm.dtype, device=prm.device)
+        layer._exl3_inners = None
+        layer._exl3_inner = None
+        layer._exl3_fused_stash = {}
+        del w
+
     def apply(self, layer, x, bias=None):
+        if getattr(layer, "_w8_q", None) is not None:
+            return apply_marlin_w8(layer, x, bias)
         inners = getattr(layer, "_exl3_inners", None)
         inner = getattr(layer, "_exl3_inner", None)
         if inner is None and not inners:

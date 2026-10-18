@@ -15,3 +15,4 @@ exl3/site*/
 exl3/src/
 exl3/tune-cache/
 q3/*.log
+exl3/ubench/pipes

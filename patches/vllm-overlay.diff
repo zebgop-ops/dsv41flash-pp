@@ -665,12 +665,12 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/
              num_experts=self.n_routed_experts,
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/amd/rocm.py vllm/models/deepseek_v4_1/amd/rocm.py
 --- image-official/models/deepseek_v4_1/amd/rocm.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/models/deepseek_v4_1/amd/rocm.py	2026-10-17 17:35:44.303097168 -0700
++++ vllm/models/deepseek_v4_1/amd/rocm.py	2026-10-17 19:47:25.399076421 -0700
 @@ -638,6 +638,12 @@
  
      def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
          # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.
-+        if getattr(self.wo_a, "weight", None) is None:  # dsv41 exl3: packed wo_a, one matrix per o-group
++        if getattr(self.wo_a, "weight", None) is None and getattr(self.wo_a, "_dsv4_wo_a_bf16", None) is None:  # dsv41 exl3: packed wo_a, one matrix per o-group
 +            from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _fused_inverse_rope_gptj
 +            o_ref = _fused_inverse_rope_gptj(o, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
 +            o_ref = o_ref.view(o.shape[0], self.n_local_groups, -1)
@@ -3519,7 +3519,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
                  slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
 diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/worker/gpu_worker.py vllm/v1/worker/gpu_worker.py
 --- image-official/v1/worker/gpu_worker.py	2026-09-09 23:38:04.000000000 -0700
-+++ vllm/v1/worker/gpu_worker.py	2026-09-11 22:48:53.772949536 -0700
++++ vllm/v1/worker/gpu_worker.py	2026-10-17 19:35:08.916591488 -0700
 @@ -99,6 +99,26 @@
  
  logger = init_logger(__name__)
@@ -3586,7 +3586,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
          if forward_pass and not get_pp_group().is_first_rank:
              tensor_dict, comm_handles, comm_postprocess = (
                  get_pp_group().irecv_tensor_dict(
-@@ -1172,21 +1217,93 @@
+@@ -1172,21 +1217,96 @@
                  comm_handles=comm_handles,
                  comm_postprocess=comm_postprocess,
              )
@@ -3601,8 +3601,11 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
 +                raise
 +            _dsv41_t1 = time.perf_counter()
 +        _dsv41_prof = None
-+        if os.environ.get("DSV41_DEBUG_PROFILE") == "1" and scheduler_output.total_num_scheduled_tokens == 1:
-+            self._dsv41_pcount = getattr(self, "_dsv41_pcount", 0) + 1
++        _dsv41_pT = scheduler_output.total_num_scheduled_tokens
++        if os.environ.get("DSV41_DEBUG_PROFILE") == "1" and str(_dsv41_pT) in os.environ.get("DSV41_DEBUG_PROFILE_T", "1").split(","):
++            _pc = self.__dict__.setdefault("_dsv41_pcounts", {})
++            _pc[_dsv41_pT] = _pc.get(_dsv41_pT, 0) + 1
++            self._dsv41_pcount = _pc[_dsv41_pT]
 +            if self._dsv41_pcount in (40, 41):
 +                from torch.profiler import ProfilerActivity, profile as _tprofile
 +                _dsv41_prof = _tprofile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
@@ -3651,7 +3654,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
 +                rows = sorted(ka, key=lambda e: -getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)))
 +                tot = sum(getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)) for e in ka
 +                          if not getattr(e, "is_async", False))
-+                lines = [f"DSV41 PROFILE rank {get_pp_group().rank_in_group} T=1 step: kernels by device time (us); "
++                lines = [f"DSV41 PROFILE rank {get_pp_group().rank_in_group} T={_dsv41_pT} step: kernels by device time (us); "
 +                         f"self-cpu total {sum(e.self_cpu_time_total for e in ka):.0f} us; device total {tot:.0f} us"]
 +                for e in rows[:40]:
 +                    dt = getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0))
@@ -3690,7 +3693,7 @@ diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/work
  
          assert isinstance(output, IntermediateTensors)
          parallel_config = self.vllm_config.parallel_config
-@@ -1204,6 +1321,9 @@
+@@ -1204,6 +1324,9 @@
              all_gather_tensors=all_gather_tensors,
          )
          self._pp_send_work = handles[1:]

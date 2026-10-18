@@ -156,28 +156,40 @@ interrupted when the GPUs were needed elsewhere and are pending (`tools/eval-101
 ### DeepSeek-V4.1-Flash-1017 EXL3 2.9 bpw, every expert on the GPUs (`serve/run-dsv41-exl3-pp4.sh`, :8008)
 
 `LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw` through exllamav3 1.6.3 kernels built for sm_80
-(FINDINGS §11): routed experts K=3 (layers 18-22 K=2) in the fused trellis MoE kernel, attention /
-shared experts / compressor / indexer / head as EXL3 linears, Engram tables from the MXFP4 1017
-snapshot. Partition 10,10,10,10, no CPU experts, utilization 0.91, 262,144-token window, n-gram K=3,
-`FULL_AND_PIECEWISE` graphs. Same prompts as above, streaming with thinking off unless noted.
+(FINDINGS §11): routed experts K=3 (layers 18-22 K=2) in exllamav3's cooperative MoE kernel for 1-8
+tokens and its fused kernel with tiered row tiles for prefill; attention / shared-expert / compressor /
+indexer linears reconstructed at load into Marlin W8A16 (`wo_a` into one bf16 batched matmul); the 6-bit
+EXL3 head; Engram tables from the MXFP4 1017 snapshot. Partition 10,10,10,10, no CPU experts, utilization
+0.91, 262,144-token window, no speculation, `FULL_DECODE_ONLY` graphs. Same prompts as above, streaming
+with thinking off unless noted, warm server (the first requests after a boot compile shapes), SM clocks
+left to the boost governor (1140-1470 MHz here; FINDINGS §11).
 
-| workload | MXFP4 1017, 12 CPU layers | EXL3 1017, all-GPU | REAP-272E, n-gram (reference) |
-|---|---|---|---|
-| free prose, 400 tokens streaming | 30.6 s (13.1 tok/s) | 24.0 s (16.7 tok/s, 64 ms/step) | 12.7-14.2 s (28-31 tok/s) |
-| code edit, 529-token prompt, 400 tokens streaming | 27.2 s | 12.0 s (123 steps, 97% drafts accepted) | 6.0 s |
-| specbench prose / code-edit (thinking on, incl. prefill) | 12.7 / 13.2 tok/s | 12.5 / 25.6 tok/s | 28.3 / 43.3 tok/s |
-| prefill 1.5k / 6k / 12k-token prompts | ~180-200 tok/s | 0.5k / 1.1k / 0.8k tok/s (measured beside an MMLU run) | 2.4k / 3.1k tok/s |
-| KV pool | 4.26M tokens at 262k | 4.39M tokens at 262k | 4.7M at 131k |
-| GPU used per rank while serving | 56.3 / 57.7 / 57.1 / 60.1 GiB (util 0.93) | 58.2 / 53.5 / 52.3 / 58.4 GiB (util 0.91) | up to 59 GiB (util 0.93) |
-| host RAM | 99 GB | ~16 GB | ~16 GB |
-| load to first request | ~7 min (CPU expert repack) | ~2.5 min (weights 70 s, graphs 3 s) | ~3 min |
-| greedy code-edit output vs the MXFP4 1017 | – | identical (prose diverges at char 124) | identical to base |
+| workload | MXFP4 1017, 12 CPU layers | EXL3, first build | EXL3, final | REAP-272E, n-gram (reference) |
+|---|---|---|---|---|
+| free prose, 400 tokens streaming | 30.6 s (13.1 tok/s) | 24.0 s (16.7 tok/s) | 13.8 s (29 tok/s) | 12.7-14.2 s (28-31 tok/s) |
+| code edit, 529-token prompt, 400 tokens streaming | 27.2 s | 12.0 s (n-gram on) | 14.4 s | 6.0 s |
+| specbench prose / code-edit (thinking on, incl. prefill) | 12.7 / 13.2 tok/s | 12.5 / 25.6 tok/s | 27.7-29.8 / 27.8 tok/s | 28.3 / 43.3 tok/s |
+| 4 concurrent prose streams, 200 tokens each | – | 22.6 tok/s aggregate | 66-71 tok/s aggregate | – |
+| prefill 1.5k / 6k / 33k-token prompts | ~180-200 tok/s | 0.5k / 1.1k / – tok/s | 0.85k / 2.0k / 2.6k tok/s | 2.4k / 3.1k (6k / 14k) |
+| KV pool | 4.26M tokens at 262k | 4.39M tokens | 3.75M tokens (14x a 262k request) | 4.7M at 131k |
+| GPU used per rank while serving | 56.3 / 57.7 / 57.1 / 60.1 GiB (util 0.93) | 58.2 / 53.5 / 52.3 / 58.4 GiB | 58.8 / 54.3 / 52.9 / 59.2 GiB (util 0.91) | up to 59 GiB (util 0.93) |
+| host RAM | 99 GB | ~16 GB | ~16 GB | ~16 GB |
+| load to first request | ~7 min (CPU expert repack) | ~2.5 min | ~3 min | ~3 min |
+| greedy code-edit output | – | identical to MXFP4 1017 | identical to the first EXL3 build | identical to base |
+
+Per-layer kernel times behind it (isolated layer 23 on one card, CUDA-graph replay, `exl3/ubench/`):
+
+| tokens | fused MoE kernel | cooperative MoE kernel | dense, EXL3 kernels | dense, Marlin W8A16 |
+|---|---|---|---|---|
+| 1 | 395 µs | 286-292 µs | 184 µs | 126 µs |
+| 4 | 1265 µs | 858-923 µs | 281 µs | 126 µs |
+| 8 | 2422 µs | 1747 µs | – | – |
 
 Quality, same harness and inputs as the other rows of this file (`tools/quality.py`, paired per window):
 
 | metric | 0909 base | MXFP4 1017 | EXL3 1017 | REAP-272E (0909) |
 |---|---|---|---|---|
-| wikitext-2 perplexity (67,131 tokens, 36 windows) | 2.7147 | 2.7530 (+1.4% vs base) | 2.8503 (+3.5% vs MXFP4 1017, per-window nll +0.035 ± 0.007) | 3.4821 (+28.3%) |
+| wikitext-2 perplexity (67,131 tokens, 36 windows) | 2.7147 | 2.7530 (+1.4% vs base) | 2.8503 first build; 2.8512 final (+3.6% vs MXFP4 1017, per-window nll +0.035 ± 0.006; final vs first build −0.10%, CI includes 0) | 3.4821 (+28.3%) |
 | Python stdlib code perplexity (30,589 tokens, 16 windows) | 1.3633 | not measured | 1.3775 (+1.0% vs base, +0.010 ± 0.006) | 1.3642 |
 | MMLU-1000 (same questions, cloze) | 84.4% | not measured (interrupted) | 83.6% (−0.8 pts; McNemar p = 0.37, 927/1000 same answers, margin 3.40 → 2.92 nats) | 76.7% (p < 1e-4) |
 | HumanEval+ / MBPP+ pass@1 | 93.9% / 84.9% | – | running (`tools/eval-1017-code.sh exl3`) | 93.9% / 83.3% |

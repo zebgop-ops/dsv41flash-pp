@@ -367,6 +367,38 @@ later boots start tuned.
 loop) needs host syncs (`torch.unique(...).tolist()`) and fails capture with
 `cudaErrorStreamCaptureInvalidated`; it remains a correctness reference for eager runs only.
 
+**Speed, second round: profile first.** The first serving build decoded at 49 ms/step without speculation
+and four concurrent streams barely beat one (22.6 tok/s aggregate). The in-worker profiler
+(`DSV41_DEBUG_PROFILE=1`, now with `DSV41_DEBUG_PROFILE_T=<token counts>`) put ~11 ms of GPU time on each
+rank per token: the fused MoE kernel 4.5 ms (450 µs per layer for 6 experts), dense EXL3 GEMVs 3.0 ms, the
+rest the base stack. A per-pipe microbenchmark (`exl3/ubench/pipes.cu`) shows this card runs FFMA, IMAD,
+DP4A and HFMA2 at full GA100 rate (no FMA throttle here), and Nsight Compute (`exl3/ubench/moe_layer.py`
+under the host's ncu) shows the fused MoE kernel at 12% of DRAM bandwidth and 56% issue-slot use, ~10
+thread-instructions per weight decoded, 25% occupancy (128 registers), stalls dominated by fixed-latency
+dependencies and inter-block group barriers. Trellis decode is arithmetic-bound on A100-class silicon,
+which has little ALU per byte of bandwidth compared with the consumer GPUs EXL3 targets: the 2-bit layers
+cost exactly as much as the 3-bit ones, and each extra token in a batch adds the decode of ~4-5 more experts.
+What moved the numbers, each verified against the previous build:
+
+| change | effect |
+|---|---|
+| exact expert count at 1 token (`num_active` = top-k) | 6 groups of 11 SMs instead of 8 groups of 8 with two idle: 450 → 350 µs per layer |
+| `wo_a` rebuilt once into the bf16 `[G, out, in]` operand of the inverse-RoPE einsum | 8 latency-bound GEMV launches per layer → one batched matmul; dense 3.0 → 1.8 ms per rank; rel. err vs the packed kernel 3e-3 (bf16 rounding) |
+| tiered prefill MoE (16/32/64-row tiles by expert load, reconstruct + GEMM above 256 rows) | the 16-row kernel re-decoded hot experts once per 16 rows; prefill 1.46k → 2.61k tok/s at 33k tokens; wikitext ppl 2.8503 → 2.8541 (noise) |
+| exllamav3's cooperative MoE kernel for 1-8 tokens (`exl3_moe_coop`: two launches, no group barriers) | 1.35-1.77x faster than the fused kernel per layer, outputs equal to 2e-3; graph-safe (self-resetting counters) |
+| dense linears re-stored as Marlin W8A16 (8-bit, bf16 scale per 128 inputs; not the head) | bandwidth- instead of ALU-bound: 1.46x per layer at 1 token, 2.24x at 4; re-rounding error 0.65%; wikitext ppl −0.10% (CI includes 0) |
+| n-gram speculation off for this build | async scheduling stays on (with it off each step pays four serial host-prep + PCIe hops, ~13 ms), and a 4-token verify step costs ~2.5x a 1-token step on EXL3 |
+
+Net: prose decode 16.7 → ~29 tok/s, four streams 22.6 → ~70 tok/s aggregate, prefill ~2.6k tok/s.
+The cooperative kernel's split-K / tile-width knobs (`EXL3_MOE_COOP_KSPLIT`, `EXL3_MOE_COOP_WIDE`) were
+swept; its defaults are best on this card.
+
+**Clocks.** Under pipeline-parallel decode each card is busy only part of every step, and the boost
+governor holds the SM clock at 1140 MHz of a possible 1695 MHz with no throttle reason active; under denser
+load it drifts up to ~1470 MHz. That is the ±30% run-to-run spread in single-stream numbers, and with
+arithmetic-bound kernels a locked clock (`nvidia-smi -lgc 1695`, root) is worth up to ~1.5x more. Not done
+here: it is a host setting for the owner of the cards.
+
 **Memory at utilization 0.91.** 58.2 / 53.5 / 52.3 / 58.4 GiB per rank serving, KV pool 4.39M tokens
 at a 262,144-token window (0.93 put ranks 0 and 3 at 60.1-60.5 GiB, too close to the 61-63 GiB where
 cards have crashed). Numbers in RESULTS.md.
