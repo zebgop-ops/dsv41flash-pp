@@ -205,6 +205,7 @@ Quality, same harness and inputs as the other rows of this file (`tools/quality.
 | Python stdlib code perplexity (30,589 tokens, 16 windows) | 1.3633 | not measured | 1.3775 (+1.0% vs base, +0.010 ± 0.006) | 1.3642 |
 | MMLU-1000 (same questions, cloze) | 84.4% | not measured (interrupted) | 83.6% first build (McNemar p = 0.37); 83.3% final (p = 0.21); 83.2% final with n-gram speculation (p = 0.16; 980/1000 same answers as without) | 76.7% (p < 1e-4) |
 | HumanEval+ / MBPP+ pass@1 | 93.9% / 84.9% | – | 92.7% / 84.4% (152/164, 319/378; final build with speculation; paired vs base p = 0.62 / 0.80) | 93.9% / 83.3% |
+| GSM8K, first 200 (glm53-run harness: greedy, reasoning on, `####` answer) | – | – | 197/200 = 98.5% (0 truncated; 304 completion tokens per item; GLM53UM: 196/200 at 148) | – |
 
 The pack's card reports +0.4% prose / +1.8% code perplexity on its own held-out sets; on wikitext the
 3-bit trellis costs +3.5% here, an order of magnitude less than REAP's expert pruning (+28%), and the
